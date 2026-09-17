@@ -28,7 +28,7 @@ jobs:
       # Keep release tooling from the workflow revision, so a manual run can
       # publish tags created before this workflow or its packaging script existed.
       - name: Check out release tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -41,20 +41,20 @@ jobs:
         run: python3 scripts/release_metadata.py
 
       - name: Check out the exact tagged source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.release.outputs.commit }}
           path: work/release-source
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: work/release-source/go.mod
           cache-dependency-path: work/release-source/go.sum
 
       - name: Set up Helm
-        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        uses: azure/setup-helm@v5
         with:
           version: v3.19.0
 
@@ -83,10 +83,10 @@ jobs:
             --destination work/packages
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -98,7 +98,7 @@ jobs:
       # including for tags that predate VERSION injection in the Dockerfile.
       - name: Publish image
         id: image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@v7
         with:
           context: work/release-source
           file: Dockerfile
@@ -136,10 +136,10 @@ jobs:
           RELEASE_CHART_REGISTRY: ${{ steps.release.outputs.chart_registry }}
         run: |
           {
-            printf 'Published `%s` from commit `%s`.\n\n' "$RELEASE_TAG" "$RELEASE_COMMIT"
-            printf -- '- Image: `%s:%s`\n' "$RELEASE_IMAGE" "$RELEASE_VERSION"
-            printf -- '- Image digest: `%s`\n' "$RELEASE_DIGEST"
-            printf -- '- Chart: `oci://%s/cnpg-connect-plugin`, version `%s`\n' "$RELEASE_CHART_REGISTRY" "$RELEASE_VERSION"
+            printf "Published \`%s\` from commit \`%s\`.\n\n" "$RELEASE_TAG" "$RELEASE_COMMIT"
+            printf -- "- Image: \`%s:%s\`\n" "$RELEASE_IMAGE" "$RELEASE_VERSION"
+            printf -- "- Image digest: \`%s\`\n" "$RELEASE_DIGEST"
+            printf -- "- Chart: \`oci://%s/cnpg-connect-plugin\`, version \`%s\`\n" "$RELEASE_CHART_REGISTRY" "$RELEASE_VERSION"
             printf '\nFor anonymous installation, make both GHCR packages public after their first publication.\n'
           } >> "$GITHUB_STEP_SUMMARY"
 

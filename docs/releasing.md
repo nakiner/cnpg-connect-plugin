@@ -81,3 +81,11 @@ git push origin v0.0.2
 The tagged commit must contain the release workflow for automatic tag-push publication. The workflow derives chart/image versions from the tag; manually editing all version fields is not required for packaging. New release tags should remain fixed. Use a new version for source changes and keep installations pinned to the desired chart `--version`.
 
 The workflow can also be dispatched with an existing release tag for initial publication or recovery of a failed run. A rerun rebuilds and republishes that version; the workflow does not enforce registry tag immutability. Use a new version for changes to an already distributed release. Inspect the failed step and any already-published packages before retrying. Publishing the image and chart is not a single atomic registry operation, so a failed run can leave only one artifact available.
+
+## Validate workflow changes locally
+
+Install [ShellCheck](https://github.com/koalaman/shellcheck#installing) before running the workflow checks. Actionlint [skips ShellCheck when it cannot find it](https://github.com/rhysd/actionlint/blob/main/docs/checks.md#shellcheck-integration-for-run), so an actionlint-only pass can miss diagnostics reported by GitHub's Ubuntu runner. Use the same prerequisite check as CI:
+
+```sh
+shellcheck --version && go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
+```
