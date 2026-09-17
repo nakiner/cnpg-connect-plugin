@@ -1,0 +1,21 @@
+# The LoadBalancer must support gRPC HTTP/2; this example uses TCP TLS passthrough.
+# Install into the operator namespace. Replace all example names and CIDRs.
+fullnameOverride: cnpg-connect
+image:
+  repository: registry.example.com/cnpg-connect-plugin
+  tag: "0.1.0-dev"
+# Narrow observer RBAC to the namespace containing the example Cluster.
+watchNamespace: databases
+application:
+  service:
+    type: LoadBalancer
+    port: 443
+    annotations: {}
+    loadBalancerSourceRanges:
+      - 192.0.2.0/24
+  auth:
+    existingSecret: cnpg-connect-auth
+tls:
+  application:
+    extraDnsNames:
+      - topology.example.com

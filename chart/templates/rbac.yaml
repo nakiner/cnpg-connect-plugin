@@ -1,0 +1,49 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "connect.serviceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+---
+{{- end }}
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ if .Values.watchNamespace }}Role{{ else }}ClusterRole{{ end }}
+metadata:
+  name: {{ include "connect.fullname" . }}{{ if not .Values.watchNamespace }}-{{ .Release.Namespace }}{{ end }}
+  {{- if .Values.watchNamespace }}
+  namespace: {{ .Values.watchNamespace }}
+  {{- end }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/proxy]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ if .Values.watchNamespace }}RoleBinding{{ else }}ClusterRoleBinding{{ end }}
+metadata:
+  name: {{ include "connect.fullname" . }}{{ if not .Values.watchNamespace }}-{{ .Release.Namespace }}{{ end }}
+  {{- if .Values.watchNamespace }}
+  namespace: {{ .Values.watchNamespace }}
+  {{- end }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ if .Values.watchNamespace }}Role{{ else }}ClusterRole{{ end }}
+  name: {{ include "connect.fullname" . }}{{ if not .Values.watchNamespace }}-{{ .Release.Namespace }}{{ end }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "connect.serviceAccount" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

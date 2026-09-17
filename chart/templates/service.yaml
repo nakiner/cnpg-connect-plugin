@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "connect.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+    cnpg.io/pluginName: connect.cnpg.io
+  annotations:
+    cnpg.io/pluginPort: "9090"
+    cnpg.io/pluginServerSecret: {{ include "connect.serverSecret" . | quote }}
+    cnpg.io/pluginClientSecret: {{ include "connect.clientSecret" . | quote }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "connect.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: cnpgi
+      port: 9090
+      targetPort: cnpgi
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "connect.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+  {{- with .Values.application.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.application.service.type }}
+  {{- with .Values.application.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "connect.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.application.service.port }}
+      targetPort: discovery
+      protocol: TCP

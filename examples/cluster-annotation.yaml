@@ -1,0 +1,18 @@
+# Recommended observation mode: discovery outages do not add a native plugin
+# dependency to CNPG failover reconciliation. Uses the same plugin Deployment.
+# Merge these annotations into the Cluster. Do not add connect.cnpg.io to
+# spec.plugins; an existing entry takes precedence, even when enabled=false.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-db
+  namespace: databases
+  annotations:
+    connect.cnpg.io/enabled: "true"
+    # Optional JSON object with STRING values, using native parameter names.
+    # Omit this annotation to use defaults.
+    connect.cnpg.io/parameters: '{"serverName":"app-db-rw.databases.svc"}'
+spec:
+  instances: 3
+  storage:
+    size: 10Gi

@@ -1,0 +1,79 @@
+# Install in the same namespace as the CloudNativePG operator.
+replicaCount: 1
+nameOverride: ""
+fullnameOverride: ""
+image:
+  # Build and push this image to your registry before installing. No image is published yet.
+  repository: cnpg-connect-plugin
+  tag: "0.1.0-dev"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Empty watches all namespaces and creates a ClusterRole/ClusterRoleBinding.
+# Nonempty watches only this namespace and creates a Role/RoleBinding there.
+watchNamespace: ""
+observer:
+  pollInterval: 5s
+  ttl: 15s
+  probeTimeout: 2s
+  maxConcurrency: 8
+  # Per Kubernetes client request rate and burst allowance.
+  kubeAPIQPS: 20
+  kubeAPIBurst: 40
+
+serviceAccount:
+  create: true
+  name: ""
+rbac:
+  create: true
+
+application:
+  service:
+    type: ClusterIP
+    port: 443
+    annotations: {}
+    loadBalancerSourceRanges: []
+  auth:
+    # Required before deployment. Generate a high-entropy token; do not commit it.
+    existingSecret: cnpg-connect-auth
+    key: token
+
+# Secret names are relative to the release/operator namespace.
+# Server Secrets contain tls.crt/tls.key; CNPG1.30 trusts the server tls.crt.
+# The client Secret contains tls.crt/tls.key and, with default clientCAKey, ca.crt.
+tls:
+  plugin:
+    existingServerSecret: ""
+    existingClientSecret: ""
+    # Defaults to existingClientSecret or the generated client Secret.
+    clientCASecret: ""
+    # Set tls.crt to trust the operator-client leaf directly instead of a CA bundle.
+    clientCAKey: ca.crt
+  application:
+    existingSecret: ""
+    # Include any external LB DNS name used by clients.
+    extraDnsNames: []
+    extraIPAddresses: []
+  certManager:
+    enabled: true
+    # Creates a private CA and Issuer. Set false and provide issuerRef to use yours.
+    createIssuer: true
+    issuerRef:
+      name: ""
+      kind: Issuer
+      group: cert-manager.io
+    duration: 2160h
+    renewBefore: 360h
+  clusterDomain: cluster.local
+
+podAnnotations: {}
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+nodeSelector: {}
+tolerations: []
+affinity: {}

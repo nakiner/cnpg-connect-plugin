@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "connect.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "connect.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "connect.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "connect.serviceAccount" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: plugin
+          image: {{ printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --plugin-address=:9090
+            - --discovery-address=:8080
+            - --health-address=:8081
+            - --server-cert=/tls/plugin/tls.crt
+            - --server-key=/tls/plugin/tls.key
+            - --client-ca=/tls/client/ca.crt
+            - --discovery-cert=/tls/application/tls.crt
+            - --discovery-key=/tls/application/tls.key
+            - --auth-token-file=/auth/token
+            - --poll-interval={{ .Values.observer.pollInterval }}
+            - --ttl={{ .Values.observer.ttl }}
+            - --probe-timeout={{ .Values.observer.probeTimeout }}
+            - --max-concurrency={{ .Values.observer.maxConcurrency }}
+            - --kube-api-qps={{ .Values.observer.kubeAPIQPS }}
+            - --kube-api-burst={{ .Values.observer.kubeAPIBurst }}
+            {{- if .Values.watchNamespace }}
+            - --namespace={{ .Values.watchNamespace }}
+            {{- end }}
+          ports:
+            - name: cnpgi
+              containerPort: 9090
+            - name: discovery
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: plugin-tls
+              mountPath: /tls/plugin
+              readOnly: true
+            - name: client-ca
+              mountPath: /tls/client
+              readOnly: true
+            - name: application-tls
+              mountPath: /tls/application
+              readOnly: true
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+      volumes:
+        - name: plugin-tls
+          secret:
+            secretName: {{ include "connect.serverSecret" . }}
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        - name: client-ca
+          secret:
+            secretName: {{ include "connect.clientCASecret" . }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.tls.plugin.clientCAKey }}
+                path: ca.crt
+        - name: application-tls
+          secret:
+            secretName: {{ include "connect.applicationSecret" . }}
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        - name: auth
+          secret:
+            secretName: {{ required "application.auth.existingSecret is required" .Values.application.auth.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.application.auth.key }}
+                path: token
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

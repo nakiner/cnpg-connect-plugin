@@ -1,0 +1,26 @@
+# Native CNPG-I mode: plugin outages can delay CNPG1.30 reconciliation/failover.
+# Use cluster-annotation.yaml to avoid adding discovery to the HA control path.
+# Merge this entry into an existing CNPG Cluster, preserving other plugins.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-db
+  namespace: databases
+spec:
+  instances: 3
+  storage:
+    size: 10Gi
+  plugins:
+    - name: connect.cnpg.io
+      enabled: true
+      parameters:
+        # TLS name for internal PostgreSQL addresses; default shown for reference.
+        serverName: app-db-rw.databases.svc
+        # Each address must route to exactly the named instance, across role changes.
+        # These are PostgreSQL endpoints, separate from the topology gRPC endpoint.
+        externalEndpoints: |
+          {
+            "app-db-1": {"host": "pg1.example.com", "port": 5432, "serverName": "pg1.example.com"},
+            "app-db-2": {"host": "pg2.example.com", "port": 5432, "serverName": "pg2.example.com"},
+            "app-db-3": {"host": "pg3.example.com", "port": 5432, "serverName": "pg3.example.com"}
+          }

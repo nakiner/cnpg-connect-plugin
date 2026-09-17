@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package cnpg.connect.v1;
+
+option go_package = "github.com/nakiner/cnpg-connect-plugin/api/connect/v1;connectv1";
+
+import "google/protobuf/timestamp.proto";
+
+// TopologyService discovers individual PostgreSQL instances. Both methods
+// require Authorization: Bearer <token> metadata when authentication is enabled.
+// TLS and authentication are configured by the deployment, not this protocol.
+service TopologyService {
+  // Returns the complete current observation, including unavailable/expired
+  // snapshots. An unknown or deleted cluster returns NOT_FOUND.
+  rpc GetTopology(GetTopologyRequest) returns (Snapshot);
+
+  // Atomically subscribes and sends a complete initial snapshot, followed by
+  // complete refreshes. Unknown clusters return NOT_FOUND. Existing watchers
+  // receive deletion tombstones and can observe same-name recreation.
+  // Slow consumers may miss intermediate states. Reconnect by subscribing again;
+  // every reconnect starts with a complete snapshot, never a delta or replay.
+  rpc WatchTopology(WatchTopologyRequest) returns (stream Snapshot);
+}
+
+message GetTopologyRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+message WatchTopologyRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+message ClusterRef {
+  string namespace = 1;
+  string name = 2;
+  string uid = 3;
+}
+
+message Endpoint {
+  string host = 1;
+  uint32 port = 2;
+  // TLS certificate identity when it differs from host.
+  string server_name = 3;
+}
+
+enum Role {
+  ROLE_UNKNOWN = 0;
+  ROLE_PRIMARY = 1;
+  ROLE_STANDBY = 2;
+}
+
+enum SyncState {
+  SYNC_STATE_UNKNOWN = 0;
+  SYNC_STATE_SYNC = 1;
+  SYNC_STATE_QUORUM = 2;
+  SYNC_STATE_POTENTIAL = 3;
+  SYNC_STATE_ASYNC = 4;
+}
+
+message Member {
+  // Kubernetes Pod UID: replacement changes identity even if name/address stays.
+  string id = 1;
+  string name = 2;
+  Role role = 3;
+  SyncState sync_state = 4;
+  bool ready = 5;
+  string reason = 6;
+  // Network name -> directly reachable endpoint (internal, optional external).
+  map<string, Endpoint> endpoints = 7;
+  string node = 8;
+  string zone = 9;
+  string region = 10;
+  int64 timeline = 11;
+  string replay_lsn = 12;
+}
+
+message Snapshot {
+  string api_version = 1;
+  ClusterRef cluster = 2;
+  // Opaque and restart-safe. Changes on routing/identity changes, not on mere
+  // freshness refreshes or replay LSN changes. Never compare numerically.
+  string revision = 3;
+  google.protobuf.Timestamp observed_at = 4;
+  // Clients MUST reject expired routing even if the stream remains connected.
+  // Transport keepalives do not extend this deadline.
+  google.protobuf.Timestamp valid_until = 5;
+  bool available = 6;
+  string reason = 7;
+  string primary_id = 8;
+  bool transitioning = 9;
+  repeated Member members = 10;
+}

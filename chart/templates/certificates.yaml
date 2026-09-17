@@ -1,0 +1,116 @@
+{{- if .Values.tls.certManager.enabled }}
+{{- if .Values.tls.certManager.createIssuer }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "connect.fullname" . }}-selfsigned
+  namespace: {{ .Release.Namespace }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "connect.fullname" . }}-ca
+  namespace: {{ .Release.Namespace }}
+spec:
+  isCA: true
+  commonName: {{ include "connect.fullname" . }}-ca
+  secretName: {{ include "connect.fullname" . }}-ca
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  usages: [cert sign, crl sign]
+  issuerRef:
+    name: {{ include "connect.fullname" . }}-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "connect.fullname" . }}-ca
+  namespace: {{ .Release.Namespace }}
+spec:
+  ca:
+    secretName: {{ include "connect.fullname" . }}-ca
+---
+{{- end }}
+{{- if not .Values.tls.plugin.existingServerSecret }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "connect.fullname" . }}-server
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: {{ include "connect.serverSecret" . }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [server auth]
+  dnsNames:
+    - {{ include "connect.fullname" . }}
+    - {{ include "connect.fullname" . }}.{{ .Release.Namespace }}
+    - {{ include "connect.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "connect.fullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.tls.clusterDomain }}
+  issuerRef:
+    {{- include "connect.issuerRef" . | nindent 4 }}
+---
+{{- end }}
+{{- if not .Values.tls.plugin.existingClientSecret }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "connect.fullname" . }}-client
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: {{ include "connect.clientSecret" . }}
+  commonName: {{ include "connect.fullname" . }}-client
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  issuerRef:
+    {{- include "connect.issuerRef" . | nindent 4 }}
+---
+{{- end }}
+{{- if not .Values.tls.application.existingSecret }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "connect.fullname" . }}-application
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: {{ include "connect.applicationSecret" . }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [server auth]
+  dnsNames:
+    - {{ include "connect.fullname" . }}-api
+    - {{ include "connect.fullname" . }}-api.{{ .Release.Namespace }}
+    - {{ include "connect.fullname" . }}-api.{{ .Release.Namespace }}.svc
+    - {{ include "connect.fullname" . }}-api.{{ .Release.Namespace }}.svc.{{ .Values.tls.clusterDomain }}
+    {{- with .Values.tls.application.extraDnsNames }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.tls.application.extraIPAddresses }}
+  ipAddresses:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  issuerRef:
+    {{- include "connect.issuerRef" . | nindent 4 }}
+{{- end }}
+{{- end }}
