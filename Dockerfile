@@ -2,11 +2,12 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.4-bookworm AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/cnpg-connect-plugin ./cmd/cnpg-connect-plugin
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/cnpg-connect-plugin ./cmd/cnpg-connect-plugin
 
 FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/nakiner/cnpg-connect-plugin"

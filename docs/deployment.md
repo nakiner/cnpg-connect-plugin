@@ -72,7 +72,7 @@ The bearer token is read at startup. After replacing the token Secret, restart t
 
 ## External clients and database addresses
 
-[values-external.yaml](../examples/values-external.yaml) exposes discovery through a LoadBalancer. Replace the example DNS, source CIDR, registry, and token Secret. Configure the LB for TCP TLS passthrough or compatible end-to-end HTTP/2 gRPC forwarding; allow long-lived streaming RPCs. External DNS is managed separately. Existing database LB configuration is independent of the discovery LB.
+[values-external.yaml](../examples/values-external.yaml) exposes discovery through a LoadBalancer. Replace the example DNS, source CIDR, and token Secret. Install the versioned OCI chart shown in the README; its defaults select the matching GHCR image. Configure the LB for TCP TLS passthrough or compatible end-to-end HTTP/2 gRPC forwarding; allow long-lived streaming RPCs. External DNS is managed separately. Existing database LB configuration is independent of the discovery LB.
 
 The `externalEndpoints` parameter is a JSON map from CNPG instance name to `{host, port, serverName}`. Set it in native `spec.plugins[].parameters` or as a JSON-encoded string within the annotation-mode parameters object. Each endpoint must always reach exactly that instance, including when its role changes. Configuration rejects assigning the same host/port pair to multiple members; the actual LB routing must also preserve member identity. A shared `ro` LB can choose a different replica from the one selected by the client; it cannot implement member-specific sync/async routing. Missing external mappings remain absent; the client must not silently use an internal address from outside Kubernetes.
 

@@ -1,9 +1,9 @@
 apiVersion: v2
 name: cnpg-connect-plugin
-description: Read-only CloudNativePG topology discovery and watch API
+description: CloudNativePG role and topology discovery with a streaming API
 type: application
-version: 0.1.0
-appVersion: 0.1.0-dev
+version: 0.0.1
+appVersion: "0.0.1"
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/nakiner/cnpg-connect-plugin
 sources:

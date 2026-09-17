@@ -1,9 +1,7 @@
 # The LoadBalancer must support gRPC HTTP/2; this example uses TCP TLS passthrough.
 # Install into the operator namespace. Replace all example names and CIDRs.
 fullnameOverride: cnpg-connect
-image:
-  repository: registry.example.com/cnpg-connect-plugin
-  tag: "0.1.0-dev"
+# The OCI chart selects the matching GHCR image; no image override is needed.
 # Narrow observer RBAC to the namespace containing the example Cluster.
 watchNamespace: databases
 application:

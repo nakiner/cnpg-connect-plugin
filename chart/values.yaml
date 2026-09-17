@@ -3,9 +3,9 @@ replicaCount: 1
 nameOverride: ""
 fullnameOverride: ""
 image:
-  # Build and push this image to your registry before installing. No image is published yet.
-  repository: cnpg-connect-plugin
-  tag: "0.1.0-dev"
+  repository: ghcr.io/nakiner/cnpg-connect-plugin
+  # Defaults to the chart appVersion. Override for a custom image build.
+  tag: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 

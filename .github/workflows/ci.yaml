@@ -24,8 +24,32 @@ jobs:
         with:
           version: v3.19.0
       - run: make chart-check
+      - name: Check release packaging
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 scripts/package_chart.py \
+            --source chart \
+            --version 0.0.0-ci \
+            --image "ghcr.io/${RELEASE_REPOSITORY,,}" \
+            --revision "$RELEASE_COMMIT" \
+            --source-url "https://github.com/${RELEASE_REPOSITORY}" \
+            --destination work/packages
   image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t cnpg-connect-plugin:ci .
+      - run: docker build --build-arg VERSION=0.0.0-ci -t cnpg-connect-plugin:ci .
+      - name: Verify image version
+        run: test "$(docker run --rm cnpg-connect-plugin:ci --version)" = 0.0.0-ci
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11

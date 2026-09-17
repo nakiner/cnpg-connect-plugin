@@ -1,0 +1,148 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish (for example, v0.0.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Keep release tooling from the workflow revision, so a manual run can
+      # publish tags created before this workflow or its packaging script existed.
+      - name: Check out release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/release_metadata.py
+
+      - name: Check out the exact tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.release.outputs.commit }}
+          path: work/release-source
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: work/release-source/go.mod
+          cache-dependency-path: work/release-source/go.sum
+
+      - name: Set up Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.19.0
+
+      - name: Install chart packaging dependency
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Check tagged source before publishing
+        working-directory: work/release-source
+        run: |
+          make check race build
+          go test -tags=e2e -run '^$' ./test/e2e
+
+      - name: Prepare and validate release chart
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          RELEASE_SOURCE_URL: https://github.com/${{ github.repository }}
+        run: |
+          python3 scripts/package_chart.py \
+            --source work/release-source/chart \
+            --version "$RELEASE_VERSION" \
+            --image "$RELEASE_IMAGE" \
+            --revision "$RELEASE_COMMIT" \
+            --source-url "$RELEASE_SOURCE_URL" \
+            --destination work/packages
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The Dockerfile cross-compiles on BUILDPLATFORM; its scratch final stage
+      # executes no target binaries, so QEMU is not required for these platforms.
+      # Use the workflow revision's build recipe with the exact tagged source,
+      # including for tags that predate VERSION injection in the Dockerfile.
+      - name: Publish image
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: work/release-source
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.release.outputs.version }}
+          tags: ${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
+
+      - name: Publish Helm chart to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_CHART_REGISTRY: ${{ steps.release.outputs.chart_registry }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io \
+            --username "$GHCR_USERNAME" --password-stdin
+          helm push "work/packages/cnpg-connect-plugin-${RELEASE_VERSION}.tgz" \
+            "oci://${RELEASE_CHART_REGISTRY}"
+
+      - name: Record published artifacts
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
+          RELEASE_DIGEST: ${{ steps.image.outputs.digest }}
+          RELEASE_CHART_REGISTRY: ${{ steps.release.outputs.chart_registry }}
+        run: |
+          {
+            printf 'Published `%s` from commit `%s`.\n\n' "$RELEASE_TAG" "$RELEASE_COMMIT"
+            printf -- '- Image: `%s:%s`\n' "$RELEASE_IMAGE" "$RELEASE_VERSION"
+            printf -- '- Image digest: `%s`\n' "$RELEASE_DIGEST"
+            printf -- '- Chart: `oci://%s/cnpg-connect-plugin`, version `%s`\n' "$RELEASE_CHART_REGISTRY" "$RELEASE_VERSION"
+            printf '\nFor anonymous installation, make both GHCR packages public after their first publication.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of Helm registry
+        if: always()
+        run: helm registry logout ghcr.io || true
