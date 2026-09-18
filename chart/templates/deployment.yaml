@@ -57,6 +57,7 @@ spec:
             - --ttl={{ .Values.observer.ttl }}
             - --probe-timeout={{ .Values.observer.probeTimeout }}
             - --max-concurrency={{ .Values.observer.maxConcurrency }}
+            - --max-concurrent-clusters={{ .Values.observer.maxConcurrentClusters }}
             - --kube-api-qps={{ .Values.observer.kubeAPIQPS }}
             - --kube-api-burst={{ .Values.observer.kubeAPIBurst }}
             {{- if .Values.watchNamespace }}

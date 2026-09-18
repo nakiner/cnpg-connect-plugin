@@ -50,6 +50,31 @@ func TestGRPCTokenlessConnectionDefaults(t *testing.T) {
 	}
 }
 
+func TestGRPCGetRequestsObservationBeforeReading(t *testing.T) {
+	s := NewStore()
+	input := sampleSnapshot()
+	input.Available = false
+	input.Reason = "awaiting_observation"
+	s.Put(input)
+	s.SetDemandHandler(func(namespace, name string) {
+		current, found := s.Get(namespace, name)
+		if !found {
+			return
+		}
+		current.Available = true
+		current.Reason = "refreshed"
+		s.Put(current)
+	}, time.Minute)
+	client := testClient(t, s, "")
+	got, err := client.GetTopology(rpcContext(t), &connectv1.GetTopologyRequest{Namespace: "database", Name: "postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Available || got.Reason != "refreshed" || !s.HasDemand("database", "postgres") {
+		t.Fatal("GetTopology did not request an observation before retrieving the snapshot")
+	}
+}
+
 func testClient(t *testing.T, store *Store, token string) connectv1.TopologyServiceClient {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)

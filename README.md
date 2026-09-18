@@ -28,7 +28,7 @@ defer pool.Close()
 
 Primary connections are the default. The library also supports standby policies, native pgx, `database/sql`, and Bun. See [Connect applications](#connect-applications).
 
-**Release status:** the simplified setup and connection metadata described here require a new plugin and client release. Plugin `v0.0.3` predates these changes. Until the new artifacts are published, build this checkout with the [local image and chart instructions](#run-this-checkout). The OCI commands below use `CNPG_CONNECT_VERSION`, set to the published version containing these changes, without a leading `v`.
+**Release status:** the watch-driven observer described here requires a new plugin image and chart release. Until those artifacts are published, build this checkout with the [local image and chart instructions](#run-this-checkout). The application protobuf API is unchanged. The OCI commands below use `CNPG_CONNECT_VERSION`, set to the published version you intend to install, without a leading `v`.
 
 ## Install in Kubernetes
 
@@ -114,6 +114,8 @@ Replace `GetTopology` with `WatchTopology` to watch the stream. The API does not
 
 A healthy response has `available: true`, a future `validUntil`, a `primaryId`, eligible `members`, and `connection` metadata containing the default database and public PostgreSQL CA. The CA is encoded as base64 in protobuf JSON. Each streamed message replaces the previous snapshot; refreshes can keep the same revision while extending its validity.
 
+Instance observation starts when a client requests that Cluster. An initial response can therefore be unavailable with `awaiting_observation`; `WatchTopology` receives the completed observation automatically. A unary `GetTopology` schedules collection and returns the current snapshot, so repeat it after collection completes when diagnosing an idle Cluster.
+
 The library handles stream renewal and reconnection. `grpcurl` is a diagnostic client and must be restarted when its stream ends. See the [API contract](docs/api.md) for role, freshness, and failure semantics.
 
 ## Connect applications
@@ -134,8 +136,10 @@ The library imports the canonical protobuf messages and generated streaming clie
 flowchart LR
     A[Application / cnpgconnect-go] -->|Verified TLS / gRPC stream| G[TLS Gateway]
     G -->|HTTP/2 / internal Service| P[cnpg-connect-plugin]
-    P -->|Read topology and public PostgreSQL CA| K[Kubernetes API]
-    A -->|Verified PostgreSQL TLS / database login| D[Selected PostgreSQL instance]
+    K[Kubernetes API] -->|Cluster and Pod watch events| P
+    P -->|Initial lists and named public CA reads| K
+    P -->|Direct instance status on port 8000| D[Selected PostgreSQL instance]
+    A -->|Verified PostgreSQL TLS / database login| D
     O[CNPG operator] -.->|Optional native integration / mTLS| P
 ```
 
@@ -144,6 +148,12 @@ flowchart LR
 | CNPG-I `:9090` | `cnpg-connect:9090` | Operator integration with mutual TLS |
 | Discovery `:8080` | `cnpg-connect-api:443` | Application gRPC API; TLS or internal h2c behind a TLS Gateway |
 | Health `:8081` | No Service | Kubernetes HTTP liveness/readiness probes |
+
+Shared Kubernetes watches maintain Cluster and CNPG Pod metadata in memory. A change queues only the affected Cluster; there is no periodic global rescan or fixed 100 ms event delay. Instance status collection runs only for Clusters with discovery consumers, and one collection serves all subscribers to that Cluster.
+
+Primary/routing changes cancel obsolete in-flight collections. A share of the worker and probe limits is reserved for urgent events, so unrelated slow background checks cannot occupy all capacity. With the defaults, four of the 32 workers and 16 of the 128 probe slots are reserved; the limits include these reservations. Replica verification and conflicting-primary checks still run before a usable topology is published.
+
+CNPG 1.30 does not publish actual synchronous/asynchronous replication state through a stream. The plugin therefore checks `/pg/status` directly on active Clusters' instances, immediately after relevant events and periodically for changes that have no Kubernetes event. These bounded checks use the existing PostgreSQL CA for HTTPS, bypass the Kubernetes API proxy, and need no database password or client certificate. The client-facing API remains a gRPC stream. See [event delivery and scaling](docs/deployment.md#event-delivery-and-scaling).
 
 The application API is read-only and tokenless by default: anyone who can reach it can discover observed Clusters in the configured watch scope. Only public connection metadata is returned, never PostgreSQL passwords or private keys. An optional bearer token is available for deployments that want it; see [optional discovery authentication](docs/deployment.md#optional-discovery-authentication).
 
@@ -162,12 +172,15 @@ See [chart/values.yaml](chart/values.yaml) for all values and [runtime flags](do
 | `tls.application.existingSecret` | Empty | Existing discovery server certificate when plugin TLS is enabled |
 | `application.auth.existingSecret`, `.key` | Empty, `token` | Optional bearer authentication; empty means no token required |
 | `tls.certManager.enabled`, `.createIssuer` | `true`, `true` | Generate CNPG-I and, when enabled, discovery certificates |
-| `observer.pollInterval`, `.ttl`, `.probeTimeout` | `5s`, `15s`, `2s` | Observation refresh, expiry, and per-instance probe timeout |
-| `observer.maxConcurrency` | `8` | Parallel instance probes |
-| `observer.kubeAPIQPS`, `.kubeAPIBurst` | `20`, `40` | Kubernetes client request limits |
+| `observer.pollInterval`, `.ttl`, `.probeTimeout` | `5s`, `15s`, `2s` | Active Cluster status refresh, snapshot expiry/unary demand lease, and direct instance request timeout |
+| `observer.maxConcurrency` | `128` | Maximum parallel instance probes across active Clusters |
+| `observer.maxConcurrentClusters` | `32` | Whole-Cluster collections running at once; independent of the instance probe cap |
+| `observer.kubeAPIQPS`, `.kubeAPIBurst` | `20`, `40` | Kubernetes metadata/CA request limits; direct instance checks do not use this limiter |
+| `resources.requests` | `250m`, `256Mi` | CPU and memory reserved for scheduling |
+| `resources.limits` | `2` CPUs, `1Gi` | Container limits; Go automatically adapts CPU parallelism to the CPU limit |
 | `serviceAccount.create`, `rbac.create` | `true`, `true` | Chart-managed identity and permissions |
 
-The observer has read access to Clusters, Pods, Pod status proxies, and Secrets in its watch scope. Secret access is `get` only and is used to fetch the referenced PostgreSQL server CA; the API publishes certificate blocks only. Set `watchNamespace` to keep this scope local to your database namespace when practical. The TTL must exceed the poll interval plus probe timeout; the client expires stale snapshots automatically.
+The observer has read access to Clusters, Pods, and Secrets in its watch scope. Secret access is `get` only and fetches the named PostgreSQL server CA; the API publishes certificate blocks only. No Pod proxy permission is needed. Network policies must allow plugin Pods to reach database Pod IPs on TCP 8000. Set `watchNamespace` to keep metadata and Secret access local to your database namespace when practical. The TTL must exceed the status refresh interval plus probe timeout; the client expires stale snapshots automatically.
 
 Cluster parameters are optional: `serverName` overrides the default PostgreSQL TLS identity `<cluster>-rw.<namespace>.svc`; `externalEndpoints` provides per-instance external addresses. Set parameters with the optional `connect.cnpg.io/parameters` annotation, or in a native plugin entry when using that integration.
 
@@ -183,11 +196,17 @@ kubectl -n cnpg-system rollout status deployment/cnpg-connect --timeout=180s
 
 `/healthz` checks process liveness; `/readyz` reports observer initialization. Querying topology confirms that a particular database currently has a usable routing view.
 
+An info-level `topology changed` log reports the Cluster, primary, member roles and sync states, availability/reason, and observation duration when routing changes. Routine freshness renewals do not produce a promotion log. The new observer's production switchover latency has not yet been measured; earlier timing measurements apply to the previous implementation.
+
 Upgrade using the same OCI command and values file with a new published `CNPG_CONNECT_VERSION`. Helm uses the matching image by default. Keep certificate, Gateway, and endpoint settings in your deployment configuration. Use `helm history connect -n cnpg-system` and `helm rollback connect REVISION -n cnpg-system --wait` to return to a previous Helm revision; rollback does not restore external Secrets or database state.
 
 Existing installations that set `application.auth.existingSecret` retain bearer authentication until that value is cleared. To move to the simple setup, remove that setting, configure the TLS Gateway, and use a plugin/client release containing connection metadata. PostgreSQL login credentials remain unchanged.
 
-Additional replicas observe independently; Kubernetes API traffic scales with their count. Streams reconnect to any healthy replica and receive a complete snapshot. The chart does not create a PodDisruptionBudget, HPA, or NetworkPolicy. See [deployment and operations](docs/deployment.md) for certificate rotation, private endpoint configurations, network behavior, and RBAC details.
+Additional replicas keep independent watches and observe the Clusters requested by their own clients. Work is shared between subscribers within a replica, but not across replicas. Streams reconnect to any healthy replica and receive a complete snapshot. The chart does not create a PodDisruptionBudget, HPA, or NetworkPolicy. See [deployment and operations](docs/deployment.md) for certificate rotation, private endpoint configurations, network behavior, and RBAC details.
+
+For thousands of databases, budget status traffic by active instance count, not service count: approximately `active instances / refresh interval` requests per second per plugin replica. See [capacity planning](docs/deployment.md#capacity-planning) for concurrency, startup CA reads, memory, and the limits of the synthetic scale test. A [large-installation values example](examples/values-large.yaml) provides API startup and resource budgets without changing application configuration.
+
+`observer.pollInterval: 100ms` is supported, but it is a delay between collections, not a fleet-wide freshness guarantee. At 6,000 active three-instance Clusters, refreshing every instance ten times a second would require about 180,000 status requests/second. Primary-change events use the priority queue immediately. Go 1.26 reads the container CPU limit automatically; leave `GOMAXPROCS` unset. The [capacity guide](docs/deployment.md#capacity-planning) explains the measured difference between event latency and periodic refresh latency.
 
 ## Troubleshooting
 
@@ -202,7 +221,8 @@ Additional replicas observe independently; Kubernetes API traffic scales with th
 | `NotFound` | Namespace/name, watch scope, and explicit observation disablement |
 | `connection_defaults_unavailable` | CNPG server CA Secret exists, contains valid public `ca.crt`, and is readable by the plugin |
 | Database name cannot be discovered | Configure CNPG's bootstrap application database or use the client's advanced `ConnConfig` |
-| Snapshot unavailable or expired | Primary transition, Pod readiness/fencing, instance status access, or API throttling |
+| `awaiting_observation` | First demand for an idle Cluster; keep `WatchTopology` open for the completed observation |
+| Snapshot unavailable or expired | Primary transition, Pod readiness/fencing, metadata watch health, or direct Pod IP:8000 access/TLS |
 | Discovery works but SQL does not | Database credentials and reachability of the advertised member addresses; external clients need external mappings |
 | Streams disconnect periodically | Normal connection renewal or Gateway/LB idle timeout; the library reconnects |
 
@@ -229,7 +249,7 @@ helm upgrade --install connect ./chart \
   --wait --timeout 5m
 ```
 
-The build architecture must match the nodes. For a multi-platform image, use `docker buildx build --platform linux/amd64,linux/arm64 --tag IMAGE --push .`. Configure the Gateway as above; Clusters are discovered automatically. The updated client must also be built from the matching checkout until its release is published.
+The build architecture must match the nodes. For a multi-platform image, use `docker buildx build --platform linux/amd64,linux/arm64 --tag IMAGE --push .`. Configure the Gateway as above; Clusters are discovered automatically. The observer changes preserve the protobuf API used by existing compatible client releases.
 
 For a local observer, use an explicit kubeconfig:
 
@@ -243,6 +263,8 @@ For a local observer, use an explicit kubeconfig:
 ```
 
 `--insecure` disables both listeners' TLS for local development; the Helm chart never enables it. Use `grpcurl -plaintext` for this local endpoint. `--discovery-plaintext`, used by the Gateway chart values, disables only application-listener TLS and preserves CNPG-I mutual TLS.
+
+The observer process must be able to route to database Pod IPs on TCP 8000. A laptop kubeconfig alone does not provide that route; run the observer in Kubernetes or connect the local process to the Pod network.
 
 `make generate` regenerates the protocol bindings with pinned Go generators under `work/bin`. The [release workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml) publishes versioned GHCR images and OCI charts. See [release instructions](docs/releasing.md), the [validation record](docs/validation.md), and [opt-in integration tests](test/e2e/README.md).
 

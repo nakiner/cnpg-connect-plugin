@@ -4,10 +4,12 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/cloudnative-pg/cnpg-i/pkg/identity"
 	"github.com/cloudnative-pg/cnpg-i/pkg/reconciler"
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/nakiner/cnpg-connect-plugin/internal/config"
 )
@@ -15,7 +17,7 @@ import (
 // Notifier schedules an observation without waiting for it to finish.
 // Implementations must return promptly and coalesce repeated notifications.
 type Notifier interface {
-	Notify()
+	Notify(namespace, name string)
 }
 
 // Service implements only Identity and Cluster reconciliation notifications.
@@ -70,17 +72,29 @@ func (s *Service) GetCapabilities(context.Context, *reconciler.ReconcilerHooksCa
 	}, nil
 }
 
-func (s *Service) Pre(context.Context, *reconciler.ReconcilerHooksRequest) (*reconciler.ReconcilerHooksResult, error) {
-	return s.notify(), nil
+func (s *Service) Pre(_ context.Context, request *reconciler.ReconcilerHooksRequest) (*reconciler.ReconcilerHooksResult, error) {
+	return s.notify(request), nil
 }
 
-func (s *Service) Post(context.Context, *reconciler.ReconcilerHooksRequest) (*reconciler.ReconcilerHooksResult, error) {
-	return s.notify(), nil
+func (s *Service) Post(_ context.Context, request *reconciler.ReconcilerHooksRequest) (*reconciler.ReconcilerHooksResult, error) {
+	return s.notify(request), nil
 }
 
-func (s *Service) notify() *reconciler.ReconcilerHooksResult {
+func (s *Service) notify(request *reconciler.ReconcilerHooksRequest) *reconciler.ReconcilerHooksResult {
 	if s.notifier != nil {
-		s.notifier.Notify()
+		// The payload supplies only a queue key. State from a reconciliation
+		// hook is not an authoritative observation and must never be published.
+		var cluster struct {
+			Metadata struct {
+				Namespace string `json:"namespace"`
+				Name      string `json:"name"`
+			} `json:"metadata"`
+		}
+		if err := json.Unmarshal(request.GetClusterDefinition(), &cluster); err == nil &&
+			len(validation.IsDNS1123Label(cluster.Metadata.Namespace)) == 0 &&
+			len(validation.IsDNS1123Subdomain(cluster.Metadata.Name)) == 0 {
+			s.notifier.Notify(cluster.Metadata.Namespace, cluster.Metadata.Name)
+		}
 	}
 	return &reconciler.ReconcilerHooksResult{Behavior: reconciler.ReconcilerHooksResult_BEHAVIOR_CONTINUE}
 }

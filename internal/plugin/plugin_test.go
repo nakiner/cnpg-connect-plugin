@@ -3,7 +3,8 @@ package plugin
 import (
 	"context"
 	"net"
-	"sync/atomic"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,9 +17,24 @@ import (
 	"github.com/nakiner/cnpg-connect-plugin/internal/config"
 )
 
-type countNotifier struct{ calls atomic.Int64 }
+type notification struct{ namespace, name string }
 
-func (n *countNotifier) Notify() { n.calls.Add(1) }
+type countNotifier struct {
+	mu    sync.Mutex
+	calls []notification
+}
+
+func (n *countNotifier) Notify(namespace, name string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.calls = append(n.calls, notification{namespace, name})
+}
+
+func (n *countNotifier) notifications() []notification {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]notification(nil), n.calls...)
+}
 
 func TestCNPGProtocol(t *testing.T) {
 	listener := bufconn.Listen(1 << 20)
@@ -63,14 +79,84 @@ func TestCNPGProtocol(t *testing.T) {
 		t.Fatalf("unexpected hook capabilities: %v, %v", kinds, err)
 	}
 	for _, call := range []func(context.Context, *reconciler.ReconcilerHooksRequest, ...grpc.CallOption) (*reconciler.ReconcilerHooksResult, error){hooks.Pre, hooks.Post} {
+		result, err := call(ctx, &reconciler.ReconcilerHooksRequest{
+			ClusterDefinition: []byte(`{"metadata":{"namespace":"dev","name":"rent"},"status":{"currentPrimary":"untrusted"}}`),
+		})
+		if err != nil || result.GetBehavior() != reconciler.ReconcilerHooksResult_BEHAVIOR_CONTINUE {
+			t.Fatalf("hook blocked reconciliation: %v, %v", result, err)
+		}
 		// Hook payloads are hints only; malformed/stale state cannot interrupt
 		// the operator's own reconciliation or become a trusted topology.
-		result, err := call(ctx, &reconciler.ReconcilerHooksRequest{ClusterDefinition: []byte("malformed")})
+		result, err = call(ctx, &reconciler.ReconcilerHooksRequest{ClusterDefinition: []byte("malformed")})
 		if err != nil || result.GetBehavior() != reconciler.ReconcilerHooksResult_BEHAVIOR_CONTINUE {
 			t.Fatalf("hook blocked reconciliation: %v, %v", result, err)
 		}
 	}
-	if notifier.calls.Load() != 2 {
-		t.Fatalf("expected both hooks to notify, got %d", notifier.calls.Load())
+	if got, want := notifier.notifications(), []notification{{"dev", "rent"}, {"dev", "rent"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected targeted hook notifications: got %v, want %v", got, want)
+	}
+}
+
+func TestHookInvalidPayloadsNeverEnqueue(t *testing.T) {
+	notifier := &countNotifier{}
+	service := &Service{notifier: notifier}
+	for _, payload := range []string{
+		"", "null", "malformed", "[]", "{}",
+		`{"metadata":{"namespace":"dev"}}`,
+		`{"metadata":{"name":"rent"}}`,
+		`{"metadata":{"namespace":"dev","name":42}}`,
+		`{"metadata":{"namespace":"../dev","name":"rent"}}`,
+		`{"metadata":{"namespace":"dev","name":"INVALID"}}`,
+		`{"metadata":{"namespace":"dev","name":"rent"}} {}`,
+	} {
+		for _, hook := range []func(context.Context, *reconciler.ReconcilerHooksRequest) (*reconciler.ReconcilerHooksResult, error){service.Pre, service.Post} {
+			result, err := hook(context.Background(), &reconciler.ReconcilerHooksRequest{ClusterDefinition: []byte(payload)})
+			if err != nil || result.GetBehavior() != reconciler.ReconcilerHooksResult_BEHAVIOR_CONTINUE {
+				t.Fatalf("invalid payload %q blocked reconciliation: %v, %v", payload, result, err)
+			}
+		}
+	}
+	result, err := service.Pre(context.Background(), nil)
+	if err != nil || result.GetBehavior() != reconciler.ReconcilerHooksResult_BEHAVIOR_CONTINUE {
+		t.Fatalf("nil request blocked reconciliation: %v, %v", result, err)
+	}
+	if got := notifier.notifications(); len(got) != 0 {
+		t.Fatalf("invalid payloads triggered observation work: %v", got)
+	}
+}
+
+type queuedNotifier chan notification
+
+func (n queuedNotifier) Notify(namespace, name string) {
+	select {
+	case n <- notification{namespace, name}:
+	default:
+	}
+}
+
+func TestHooksDoNotWaitForObservation(t *testing.T) {
+	// No worker consumes this queue. Both hooks must still return once their
+	// notification is queued or coalesced, even if collection cannot proceed.
+	queue := make(queuedNotifier, 1)
+	service := &Service{notifier: queue}
+	request := &reconciler.ReconcilerHooksRequest{ClusterDefinition: []byte(`{"metadata":{"namespace":"dev","name":"rent"}}`)}
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.Pre(context.Background(), request)
+		if err == nil {
+			_, err = service.Post(context.Background(), request)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hooks waited for an observation to complete")
+	}
+	if got := <-queue; got != (notification{"dev", "rent"}) {
+		t.Fatalf("queued wrong cluster: %v", got)
 	}
 }

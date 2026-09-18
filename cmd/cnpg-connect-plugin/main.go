@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -28,26 +29,27 @@ import (
 var version = "dev"
 
 type settings struct {
-	pluginAddress      string
-	discoveryAddress   string
-	healthAddress      string
-	serverCert         string
-	serverKey          string
-	clientCA           string
-	discoveryCert      string
-	discoveryKey       string
-	discoveryPlaintext bool
-	authTokenFile      string
-	namespace          string
-	kubeconfig         string
-	kubeAPIQPS         float64
-	kubeAPIBurst       int
-	pollInterval       time.Duration
-	ttl                time.Duration
-	probeTimeout       time.Duration
-	maxConcurrency     int
-	insecure           bool
-	showVersion        bool
+	pluginAddress         string
+	discoveryAddress      string
+	healthAddress         string
+	serverCert            string
+	serverKey             string
+	clientCA              string
+	discoveryCert         string
+	discoveryKey          string
+	discoveryPlaintext    bool
+	authTokenFile         string
+	namespace             string
+	kubeconfig            string
+	kubeAPIQPS            float64
+	kubeAPIBurst          int
+	pollInterval          time.Duration
+	ttl                   time.Duration
+	probeTimeout          time.Duration
+	maxConcurrency        int
+	maxConcurrentClusters int
+	insecure              bool
+	showVersion           bool
 }
 
 func main() {
@@ -75,12 +77,13 @@ func parseSettings(args []string, stderr io.Writer) (settings, error) {
 	flags.StringVar(&s.authTokenFile, "auth-token-file", "", "Optional legacy application bearer token file (at least 32 characters); empty disables token authentication")
 	flags.StringVar(&s.namespace, "namespace", "", "Observe this namespace only (empty means all namespaces)")
 	flags.StringVar(&s.kubeconfig, "kubeconfig", "", "Explicit kubeconfig file; default uses only in-cluster credentials")
-	flags.Float64Var(&s.kubeAPIQPS, "kube-api-qps", 20, "Kubernetes API client request rate per second")
-	flags.IntVar(&s.kubeAPIBurst, "kube-api-burst", 40, "Kubernetes API client request burst limit")
-	flags.DurationVar(&s.pollInterval, "poll-interval", 5*time.Second, "Periodic topology observation interval")
-	flags.DurationVar(&s.ttl, "ttl", 15*time.Second, "Validity period of an observed snapshot")
-	flags.DurationVar(&s.probeTimeout, "probe-timeout", 2*time.Second, "Timeout for each PostgreSQL status probe")
-	flags.IntVar(&s.maxConcurrency, "max-concurrency", 8, "Maximum simultaneous PostgreSQL status probes")
+	flags.Float64Var(&s.kubeAPIQPS, "kube-api-qps", 20, "Kubernetes metadata and public CA request rate per second")
+	flags.IntVar(&s.kubeAPIBurst, "kube-api-burst", 40, "Kubernetes metadata and public CA request burst limit")
+	flags.DurationVar(&s.pollInterval, "poll-interval", 5*time.Second, "Direct instance-status refresh interval for Clusters with discovery consumers")
+	flags.DurationVar(&s.ttl, "ttl", 15*time.Second, "Snapshot validity period and unary discovery demand lease")
+	flags.DurationVar(&s.probeTimeout, "probe-timeout", 2*time.Second, "Timeout for each direct PostgreSQL instance-status request")
+	flags.IntVar(&s.maxConcurrency, "max-concurrency", 128, "Maximum simultaneous PostgreSQL status probes")
+	flags.IntVar(&s.maxConcurrentClusters, "max-concurrent-clusters", 32, "Maximum simultaneous whole-Cluster observations")
 	flags.BoolVar(&s.insecure, "insecure", false, "Local development only: disable TLS and authentication; default addresses bind loopback")
 	flags.BoolVar(&s.showVersion, "version", false, "Print version and exit")
 	if err := flags.Parse(args); err != nil {
@@ -112,8 +115,11 @@ func (s settings) validate() error {
 	if s.kubeAPIBurst <= 0 {
 		return fmt.Errorf("kube-api-burst must be positive")
 	}
-	if s.pollInterval <= 0 || s.probeTimeout <= 0 || s.ttl <= 0 || s.maxConcurrency <= 0 {
-		return fmt.Errorf("poll-interval, probe-timeout, ttl and max-concurrency must be positive")
+	if s.pollInterval <= 0 || s.probeTimeout <= 0 || s.ttl <= 0 {
+		return fmt.Errorf("poll-interval, probe-timeout and ttl must be positive")
+	}
+	if s.maxConcurrency < 1 || s.maxConcurrency > 1024 || s.maxConcurrentClusters < 1 || s.maxConcurrentClusters > 1024 {
+		return fmt.Errorf("max-concurrency and max-concurrent-clusters must be between 1 and 1024")
 	}
 	// Subtraction avoids duration overflow when checking custom values.
 	if s.ttl <= s.pollInterval || s.ttl-s.pollInterval <= s.probeTimeout {
@@ -153,6 +159,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
+	logger.Info("runtime configuration",
+		"go_version", runtime.Version(),
+		"gomaxprocs", runtime.GOMAXPROCS(0),
+		"status_refresh_interval", s.pollInterval,
+		"max_status_probes", s.maxConcurrency,
+		"max_concurrent_clusters", s.maxConcurrentClusters,
+	)
 	runtimeOptions := server.Options{
 		PluginAddress:    s.pluginAddress,
 		DiscoveryAddress: s.discoveryAddress,
@@ -203,11 +216,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	store := discovery.NewStore()
 	collector, err := observer.New(kubeClient, dynamicClient, store, observer.Options{
-		Namespace:      s.namespace,
-		PollInterval:   s.pollInterval,
-		TTL:            s.ttl,
-		ProbeTimeout:   s.probeTimeout,
-		MaxConcurrency: s.maxConcurrency,
+		Namespace:             s.namespace,
+		PollInterval:          s.pollInterval,
+		TTL:                   s.ttl,
+		ProbeTimeout:          s.probeTimeout,
+		MaxConcurrency:        s.maxConcurrency,
+		MaxConcurrentClusters: s.maxConcurrentClusters,
 	}, logger)
 	if err != nil {
 		return err

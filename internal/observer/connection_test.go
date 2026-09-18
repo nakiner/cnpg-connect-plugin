@@ -6,12 +6,16 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
 
+	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -82,17 +86,14 @@ func TestConnectionParametersReadOnlyNamedPublicCA(t *testing.T) {
 func TestConnectionCARotationAndLoss(t *testing.T) {
 	o, kube, _ := fakeObserver(t)
 	ctx := context.Background()
-	if err := o.collect(ctx); err != nil {
-		t.Fatal(err)
-	}
+	observe(t, o)
 	before, _ := o.store.Get("test", "db")
 	public := testPublicCA(t)
 	if _, err := kube.CoreV1().Secrets("test").Update(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test"}, Data: map[string][]byte{"ca.crt": public}}, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.collect(ctx); err != nil {
-		t.Fatal(err)
-	}
+	o.connections.Delete(clusterKey{"test", "db"})
+	observe(t, o)
 	after, _ := o.store.Get("test", "db")
 	if !after.Available || after.Revision == before.Revision || !bytes.Equal(after.Connection.ServerCAPEM, public) {
 		t.Fatal("CA rotation did not refresh connection defaults and revision")
@@ -100,11 +101,53 @@ func TestConnectionCARotationAndLoss(t *testing.T) {
 	if err := kube.CoreV1().Secrets("test").Delete(ctx, "db-ca", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.collect(ctx); err != nil {
-		t.Fatal(err)
-	}
+	o.connections.Delete(clusterKey{"test", "db"})
+	observe(t, o)
 	failed, _ := o.store.Get("test", "db")
 	if failed.Available || failed.Reason != "connection_defaults_unavailable" {
 		t.Fatal("missing CA silently published unverified connection defaults")
+	}
+}
+
+func TestNetworkFailureDoesNotRefetchCAAndTLSFailureDoes(t *testing.T) {
+	o, kube, _ := fakeObserver(t)
+	observe(t, o)
+	kube.ClearActions()
+	original := o.probe
+	failure := error(errors.New("connection refused"))
+	o.probe = func(ctx context.Context, p *corev1.Pod, c v1.ConnectionParameters, s string) (instanceStatus, error) {
+		if p.Name == "db-1" {
+			return instanceStatus{}, failure
+		}
+		return original(ctx, p, c, s)
+	}
+	for range 3 {
+		observe(t, o)
+	}
+	if len(kube.Actions()) != 0 {
+		t.Fatal("network outage caused CA reads")
+	}
+	failure = fmt.Errorf("request failed: %w", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}})
+	observe(t, o)
+	o.probe = original
+	observe(t, o)
+	if len(kube.Actions()) != 1 {
+		t.Fatalf("CA verification recovery requests=%d", len(kube.Actions()))
+	}
+}
+
+func TestCARefreshesAreSpreadAcrossClusters(t *testing.T) {
+	c, _, _ := fixture()
+	seen := make(map[time.Duration]bool)
+	for i := range 2000 {
+		c.SetName(fmt.Sprint(i))
+		lifetime := connectionCacheLifetime(c)
+		if lifetime < 3*time.Minute || lifetime >= 5*time.Minute {
+			t.Fatalf("unexpected lifetime %s", lifetime)
+		}
+		seen[lifetime] = true
+	}
+	if len(seen) < 1900 {
+		t.Fatal("CA refreshes converge on the same deadline")
 	}
 }

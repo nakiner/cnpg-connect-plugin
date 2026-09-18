@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -104,6 +105,7 @@ func Run(ctx context.Context, options Options, observer Observer, registerDiscov
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	var shutdown sync.WaitGroup
+	var forced atomic.Bool
 	shutdown.Go(func() {
 		if err := healthServer.Shutdown(shutdownCtx); err != nil {
 			_ = healthServer.Close()
@@ -116,24 +118,33 @@ func Run(ctx context.Context, options Options, observer Observer, registerDiscov
 			select {
 			case <-done:
 			case <-shutdownCtx.Done():
-				srv.Stop()
+				forced.Store(true)
+				// gRPC GracefulStop can hold its internal mutex while waiting
+				// for a handler that ignores cancellation. Stop may then block
+				// on the same mutex, so it cannot hold up our shutdown deadline.
+				go srv.Stop()
 			}
 		})
 	}
 	shutdown.Wait()
-	// All listeners have now been stopped, including forced transport closure
-	// at the deadline. Only the observer can still be doing unbounded work.
-	// Check it before the expired deadline so successful forced closure cannot
-	// race an already-completed observer and become a false shutdown failure.
+	// Listeners have stopped and forced transport closure has been requested
+	// where needed. A forced gRPC stop can still wait on an uncooperative handler;
+	// its Serve worker must not extend the deadline either. Check observerDone
+	// first so a completed observer does not race the expired deadline and become
+	// a false shutdown failure.
 	select {
 	case <-observerDone:
-		workers.Wait()
+		if !forced.Load() {
+			workers.Wait()
+		}
 		return result
 	default:
 	}
 	select {
 	case <-observerDone:
-		workers.Wait()
+		if !forced.Load() {
+			workers.Wait()
+		}
 	case <-shutdownCtx.Done():
 		if result == nil {
 			result = fmt.Errorf("shutdown timed out: %w", shutdownCtx.Err())

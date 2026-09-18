@@ -1,0 +1,20 @@
+# Sizing example for 6,000 active Clusters / 18,000 instances at a 5s refresh.
+# Synthetic warm-cache tests are not a production capacity guarantee.
+# Size against measured status latency, stream count and Kubernetes API capacity.
+# Periodic instance requests go directly to Pod IPs, outside this API budget.
+observer:
+  pollInterval: 5s
+  maxConcurrency: 128
+  maxConcurrentClusters: 32
+  # 6,000 cold CA reads: best-case rate budget ~28s at 200 QPS / 400 burst,
+  # before server latency, retries, and competing traffic. Stagger client startup
+  # or increase its startup timeout for simultaneous cold fleet reconnects.
+  kubeAPIQPS: 200
+  kubeAPIBurst: 400
+resources:
+  requests:
+    cpu: "2"
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 2Gi

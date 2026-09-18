@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,8 +23,8 @@ type testObserver struct {
 	started chan struct{}
 }
 
-func (o testObserver) Notify()     {}
-func (o testObserver) Ready() bool { return false }
+func (o testObserver) Notify(string, string) {}
+func (o testObserver) Ready() bool           { return false }
 func (o testObserver) Run(ctx context.Context) error {
 	if o.started != nil {
 		close(o.started)
@@ -86,8 +87,11 @@ func testRunWithActiveWatch(t *testing.T, ignoreCancellation bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serving, watching := make(chan struct{}), make(chan struct{})
+	handlerExited := make(chan struct{})
 	releaseHandler := make(chan struct{})
-	defer close(releaseHandler)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseHandler) }) }
+	defer release()
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(ctx, Options{PluginAddress: "127.0.0.1:0", DiscoveryAddress: address, HealthAddress: "127.0.0.1:0"}, testObserver{started: serving}, func(server *grpc.Server) {
@@ -98,6 +102,7 @@ func testRunWithActiveWatch(t *testing.T, ignoreCancellation bool) {
 					StreamName:    "Watch",
 					ServerStreams: true,
 					Handler: func(_ any, stream grpc.ServerStream) error {
+						defer close(handlerExited)
 						close(watching)
 						if ignoreCancellation {
 							<-releaseHandler
@@ -150,6 +155,15 @@ func testRunWithActiveWatch(t *testing.T, ignoreCancellation bool) {
 		}
 	case <-time.After(limit):
 		t.Fatalf("active watch exceeded shutdown limit %s", limit)
+	}
+	// A deliberately uncooperative handler cannot be killed by Go. Release it
+	// once bounded shutdown returns and wait for its cleanup, so this regression
+	// test leaves neither a handler nor gRPC's stop waiters stuck behind it.
+	release()
+	select {
+	case <-handlerExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream handler did not clean up after release")
 	}
 }
 

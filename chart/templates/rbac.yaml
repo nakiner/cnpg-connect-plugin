@@ -26,9 +26,6 @@ rules:
     resources: [pods]
     verbs: [get, list, watch]
   - apiGroups: [""]
-    resources: [pods/proxy]
-    verbs: [get]
-  - apiGroups: [""]
     # Only named PostgreSQL CA Secrets are fetched; no Secret list/watch.
     resources: [secrets]
     verbs: [get]

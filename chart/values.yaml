@@ -13,11 +13,23 @@ imagePullSecrets: []
 # Nonempty watches only this namespace and creates a Role/RoleBinding there.
 watchNamespace: ""
 observer:
+  # Direct instance-status refresh for Clusters with discovery consumers.
+  # Cluster/Pod metadata arrives through watches; there is no global poll.
+  # Durations such as 100ms are supported. Budget per active instance, not per
+  # plugin: 6,000 three-instance Clusters at 100ms need about 180,000 probes/s.
   pollInterval: 5s
+  # Snapshot validity and the demand lease after a unary GetTopology request.
   ttl: 15s
+  # Plugin Pods must reach database Pod IPs on TCP 8000 for these requests.
   probeTimeout: 2s
-  maxConcurrency: 8
-  # Per Kubernetes client request rate and burst allowance.
+  # Shared global limit; consumers of the same Cluster reuse one observation.
+  maxConcurrency: 128
+  # Whole-Cluster collections run separately from the instance probe limit.
+  # One eighth of workers/probes (at least one when a limit exceeds one) is
+  # reserved for urgent events. Both limits include their reserved capacity.
+  maxConcurrentClusters: 32
+  # Per Kubernetes client rate/burst for metadata and named public CA reads.
+  # Direct instance-status requests do not pass through the Kubernetes API.
   kubeAPIQPS: 20
   kubeAPIBurst: 40
 
@@ -69,13 +81,16 @@ tls:
   clusterDomain: cluster.local
 
 podAnnotations: {}
+# Go 1.26 derives GOMAXPROCS from the CPU limit automatically. Do not set a
+# fixed GOMAXPROCS env var; it would disable runtime adjustment to limit changes.
+# Requests reserve scheduling capacity; they do not configure GOMAXPROCS.
 resources:
   requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: "1"
+    cpu: 250m
     memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
 nodeSelector: {}
 tolerations: []
 affinity: {}

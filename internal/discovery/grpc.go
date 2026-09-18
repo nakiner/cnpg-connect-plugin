@@ -36,6 +36,7 @@ func (s *Server) GetTopology(ctx context.Context, request *connectv1.GetTopology
 	if err := validateReference(request.GetNamespace(), request.GetName()); err != nil {
 		return nil, err
 	}
+	s.store.RequestRefresh(request.Namespace, request.Name)
 	snapshot, exists := s.store.Get(request.Namespace, request.Name)
 	if !exists {
 		return nil, status.Error(codes.NotFound, "cluster is not observed")
