@@ -155,6 +155,8 @@ func Run(ctx context.Context, options Options, observer Observer, registerDiscov
 
 func grpcOptions(runCtx context.Context, tlsConfig *tls.Config) []grpc.ServerOption {
 	options := []grpc.ServerOption{
+		// Idle watchers share write buffers instead of retaining one per socket.
+		grpc.SharedWriteBuffer(true),
 		grpc.MaxRecvMsgSize(4 << 20),
 		grpc.ConnectionTimeout(5 * time.Second),
 		grpc.StreamInterceptor(func(service any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {

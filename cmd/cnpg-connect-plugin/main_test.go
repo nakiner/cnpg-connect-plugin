@@ -109,7 +109,7 @@ func TestKubernetesRateLimitDefaultsAndOverrides(t *testing.T) {
 		qps   float64
 		burst int
 	}{
-		{[]string{"--insecure"}, 20, 40},
+		{[]string{"--insecure"}, 100, 200},
 		{[]string{"--insecure", "--kube-api-qps=12.5", "--kube-api-burst=25"}, 12.5, 25},
 	} {
 		s, err := parseSettings(tc.args, io.Discard)

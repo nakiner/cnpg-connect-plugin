@@ -1,9 +1,47 @@
 # Validation record
 
-This record describes the earlier bearer-authenticated implementation. It does
-not claim live validation of the newer automatic Cluster observation, tokenless
-discovery, connection metadata, or Gateway setup. The isolated lifecycle tests support optional bearer
-authentication and can be rerun against the new release.
+## September 18, 2026: unreleased scalability improvements
+
+Current source after `0.0.5` passed `make check race build`: formatting, vet,
+unit and race tests, chart lint/rendering, and binary compilation. Integration
+tests also compile with the `e2e` tag; no live deployment or switchover was run
+for these changes. The matching `cnpgconnect-go` changes passed `make check`,
+including race tests and pgx, database/sql, and Bun example checks.
+
+The new tests cover shared public-CA reads and cancellation, CA rotation,
+transport cleanup during requests, failed-primary cancellation, immutable
+snapshot fan-out, expiry/deletion/recreation ordering, reconnect bursts, and
+real HTTP/2 flow-control stalls. Existing fencing and primary verification
+tests continue to pass.
+
+Sequential Linux/arm64 component runs under a two-CPU / 2 GiB container limit
+completed 1,000 cold database discoveries in 8.04 seconds and delivered updates
+to 500 independent TLS clients at 5.83 ms p95. The repeated 6,000-Cluster warm
+simulation retained approximately 28 ms event p95. See the
+[performance guide](performance.md#unreleased-scalability-changes) for settings,
+commands, and exclusions. These tests do not establish sustained production
+capacity or replace validation of a published build in its target cluster.
+
+## September 18, 2026: live performance and synthetic fleet tests
+
+Plugin `0.0.5` and `cnpgconnect-go v0.0.5` completed two planned switchovers
+against CNPG 1.30.0 using automatic Cluster observation, tokenless internal
+gRPC discovery, connection metadata, and the deployed application's managed
+pool. Usable discovery followed PostgreSQL readiness by 154/148 ms. The
+application recovered in both directions; the original primary, synchronous
+standby, and test cleanup were verified. The separate 6,000-Cluster benchmark
+used simulated instance I/O and an in-memory gRPC transport.
+
+The [performance guide](performance.md) records versions, settings, before/after
+measurements, test commands, and measurement limits. These runs do not validate
+an external Gateway/LB, sustained production fleet capacity, or network-partition
+failover.
+
+## September 17, 2026: isolated lifecycle tests
+
+The following record describes the earlier bearer-authenticated implementation.
+Those isolated lifecycle tests support optional bearer authentication and can
+be rerun against a new release; they are not a rerun of every scenario on `0.0.5`.
 
 Local validation on 2026-09-17 used an isolated `kind-cnpg-connect-test` cluster,
 with an explicit kubeconfig separate from the user's Kubernetes contexts:

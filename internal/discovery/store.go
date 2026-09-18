@@ -17,9 +17,9 @@ import (
 type clusterKey struct{ namespace, name string }
 
 type record struct {
-	snapshot v1.Snapshot
-	routing  [sha256.Size]byte
-	expired  bool
+	*publication
+	routing [sha256.Size]byte
+	expired bool
 }
 
 // Store owns its snapshots. Inputs, return values, and subscriber deliveries are
@@ -28,14 +28,15 @@ type record struct {
 // A subscriber has room for one snapshot. Slow consumers receive the latest
 // complete state; no caller may depend on observing every intermediate revision.
 type Store struct {
-	mu          sync.Mutex
-	records     map[clusterKey]*record
-	subscribers map[clusterKey]map[chan v1.Snapshot]struct{}
-	unaryDemand map[clusterKey]time.Time
-	onDemand    func(namespace, name string)
-	unaryLease  time.Duration
-	processID   string
-	sequence    uint64
+	mu               sync.Mutex
+	records          map[clusterKey]*record
+	subscribers      map[clusterKey]map[*subscription]struct{}
+	unaryDemand      map[clusterKey]time.Time
+	onDemand         func(namespace, name string)
+	unaryLease       time.Duration
+	processID        string
+	sequence         uint64
+	publicationOrder uint64
 }
 
 func NewStore() *Store {
@@ -45,7 +46,7 @@ func NewStore() *Store {
 	}
 	return &Store{
 		records:     make(map[clusterKey]*record),
-		subscribers: make(map[clusterKey]map[chan v1.Snapshot]struct{}),
+		subscribers: make(map[clusterKey]map[*subscription]struct{}),
 		unaryDemand: make(map[clusterKey]time.Time),
 		processID:   hex.EncodeToString(id[:]),
 	}
@@ -143,7 +144,6 @@ func (s *Store) Put(snapshot v1.Snapshot) bool {
 	routing := routingDigest(snapshot)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// The snapshot may have expired while waiting to commit it.
 	if !expired && !time.Now().Before(snapshot.ValidUntil) {
 		expired = true
@@ -157,8 +157,11 @@ func (s *Store) Put(snapshot v1.Snapshot) bool {
 	} else {
 		snapshot.Revision = previous.snapshot.Revision
 	}
-	s.records[key] = &record{snapshot: snapshot, routing: routing, expired: expired}
-	s.broadcast(key, snapshot)
+	published := s.newPublication(snapshot)
+	s.records[key] = &record{publication: published, routing: routing, expired: expired}
+	notification := s.notification(key, published)
+	s.mu.Unlock()
+	notification.deliver()
 	return changed
 }
 
@@ -167,13 +170,15 @@ func (s *Store) Put(snapshot v1.Snapshot) bool {
 func (s *Store) Delete(namespace, name string) {
 	key := clusterKey{namespace, name}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.unaryDemand, key)
 	previous, exists := s.records[key]
 	if !exists {
+		s.mu.Unlock()
 		return
 	}
-	deleted := clone(previous.snapshot)
+	// The tombstone reuses immutable connection parameters, without copying
+	// the removed member topology under the store lock.
+	deleted := previous.snapshot
 	deleted.Revision = s.nextRevision()
 	deleted.Available = false
 	deleted.Reason = "deleted"
@@ -181,7 +186,9 @@ func (s *Store) Delete(namespace, name string) {
 	deleted.Transitioning = false
 	deleted.Members = []v1.Member{}
 	delete(s.records, key)
-	s.broadcast(key, deleted)
+	notification := s.notification(key, s.newPublication(deleted))
+	s.mu.Unlock()
+	notification.deliver()
 }
 
 // ClusterIdentity returns the record's immutable identity without copying its
@@ -198,19 +205,28 @@ func (s *Store) ClusterIdentity(namespace, name string) (v1.ClusterRef, bool) {
 
 // Get fails closed on stale routing even when the periodic expiry task is late.
 func (s *Store) Get(namespace, name string) (v1.Snapshot, bool) {
-	key := clusterKey{namespace, name}
-	s.mu.Lock()
-	record, exists := s.records[key]
+	published, exists := s.getPublication(namespace, name)
 	if !exists {
-		s.mu.Unlock()
 		return v1.Snapshot{}, false
 	}
-	s.expireRecord(key, record, time.Now())
-	snapshot := record.snapshot
+	return clone(published.snapshot), true
+}
+
+// getPublication is reserved for internal read-only consumers. The publication
+// remains immutable after releasing the store lock, including across expiry.
+func (s *Store) getPublication(namespace, name string) (*publication, bool) {
+	key := clusterKey{namespace, name}
+	s.mu.Lock()
+	current, exists := s.records[key]
+	if !exists {
+		s.mu.Unlock()
+		return nil, false
+	}
+	notification := s.expireRecord(key, current, time.Now())
+	published := current.publication
 	s.mu.Unlock()
-	// Published snapshots are immutable inside Store. Copying for the caller
-	// outside the lock keeps reads of unrelated databases independent.
-	return clone(snapshot), true
+	notification.deliver()
+	return published, true
 }
 
 // Subscribe atomically registers a watcher and queues the current snapshot.
@@ -225,24 +241,44 @@ func (s *Store) Subscribe(namespace, name string) (<-chan v1.Snapshot, func()) {
 // subscribe optionally rejects unknown clusters in the same critical section
 // that registers the watcher, avoiding a separate lookup/subscription race.
 func (s *Store) subscribe(namespace, name string, requireExisting bool) (<-chan v1.Snapshot, func(), bool) {
+	watcher := &subscription{snapshots: make(chan v1.Snapshot, 1)}
+	cancel, exists := s.register(namespace, name, requireExisting, watcher)
+	return watcher.snapshots, cancel, exists
+}
+
+// subscribeShared is only used by the gRPC server. Its publications and cached
+// protobuf messages are immutable; callers must never modify them.
+func (s *Store) subscribeShared(namespace, name string) (<-chan *publication, func(), bool) {
+	watcher := &subscription{publications: make(chan *publication, 1)}
+	cancel, exists := s.register(namespace, name, true, watcher)
+	return watcher.publications, cancel, exists
+}
+
+func (s *Store) register(namespace, name string, requireExisting bool, watcher *subscription) (func(), bool) {
 	key := clusterKey{namespace, name}
-	updates := make(chan v1.Snapshot, 1)
 	s.mu.Lock()
-	if _, exists := s.records[key]; !exists && requireExisting {
+	current, exists := s.records[key]
+	if !exists && requireExisting {
 		s.mu.Unlock()
-		return nil, func() {}, false
+		return func() {}, false
 	}
-	if current, exists := s.records[key]; exists {
-		s.expireRecord(key, current, time.Now())
-		updates <- clone(current.snapshot)
+	var initial *publication
+	var expired notification
+	if exists {
+		expired = s.expireRecord(key, current, time.Now())
+		initial = current.publication
 	}
 	first := len(s.subscribers[key]) == 0
 	if first {
-		s.subscribers[key] = make(map[chan v1.Snapshot]struct{})
+		s.subscribers[key] = make(map[*subscription]struct{})
 	}
-	s.subscribers[key][updates] = struct{}{}
+	s.subscribers[key][watcher] = struct{}{}
 	handler := s.onDemand
 	s.mu.Unlock()
+	expired.deliver()
+	if initial != nil {
+		watcher.deliver(initial)
+	}
 	if first && handler != nil {
 		handler(namespace, name)
 	}
@@ -251,28 +287,34 @@ func (s *Store) subscribe(namespace, name string, requireExisting bool) (<-chan 
 	cancel := func() {
 		once.Do(func() {
 			s.mu.Lock()
-			defer s.mu.Unlock()
-			delete(s.subscribers[key], updates)
+			delete(s.subscribers[key], watcher)
 			if len(s.subscribers[key]) == 0 {
 				delete(s.subscribers, key)
 			}
-			close(updates)
+			s.mu.Unlock()
+			watcher.close()
 		})
 	}
-	return updates, cancel, true
+	return cancel, true
 }
 
 // Expire invalidates expired routing without advancing observation timestamps.
 func (s *Store) Expire(now time.Time) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var notifications []notification
 	for key, current := range s.records {
-		s.expireRecord(key, current, now)
+		if expired := s.expireRecord(key, current, now); expired.publication != nil {
+			notifications = append(notifications, expired)
+		}
 	}
 	for key, deadline := range s.unaryDemand {
 		if !now.Before(deadline) {
 			delete(s.unaryDemand, key)
 		}
+	}
+	s.mu.Unlock()
+	for _, notification := range notifications {
+		notification.deliver()
 	}
 }
 
@@ -286,17 +328,20 @@ func (s *Store) hasDemand(key clusterKey, now time.Time) bool {
 	return len(s.subscribers[key]) > 0 || unary
 }
 
-func (s *Store) expireRecord(key clusterKey, current *record, now time.Time) {
+func (s *Store) expireRecord(key clusterKey, current *record, now time.Time) notification {
 	if current.expired || now.Before(current.snapshot.ValidUntil) {
-		return
+		return notification{}
 	}
-	expired := clone(current.snapshot)
+	// Only the member structs are changed during invalidation. Endpoint maps
+	// and connection parameters remain immutable and can be shared.
+	expired := current.snapshot
+	expired.Members = append([]v1.Member(nil), expired.Members...)
 	invalidate(&expired)
 	expired.Revision = s.nextRevision()
-	current.snapshot = expired
+	current.publication = s.newPublication(expired)
 	current.routing = routingDigest(expired)
 	current.expired = true
-	s.broadcast(key, current.snapshot)
+	return s.notification(key, current.publication)
 }
 
 func (s *Store) nextRevision() string {
@@ -304,16 +349,20 @@ func (s *Store) nextRevision() string {
 	return fmt.Sprintf("%s:%d", s.processID, s.sequence)
 }
 
-func (s *Store) broadcast(key clusterKey, snapshot v1.Snapshot) {
-	for updates := range s.subscribers[key] {
-		// The mutex serializes all senders and cancellation. A concurrent receiver
-		// may drain this slot; either way, the following send cannot block.
-		select {
-		case <-updates:
-		default:
-		}
-		updates <- clone(snapshot)
+func (s *Store) newPublication(snapshot v1.Snapshot) *publication {
+	s.publicationOrder++
+	return &publication{snapshot: snapshot, order: s.publicationOrder}
+}
+
+// Capture membership while committing state, then deliver outside the store
+// lock. Each mailbox rejects older publications, so concurrent commits and
+// cancellation cannot reorder a watcher or block unrelated database reads.
+func (s *Store) notification(key clusterKey, published *publication) notification {
+	watchers := make([]*subscription, 0, len(s.subscribers[key]))
+	for watcher := range s.subscribers[key] {
+		watchers = append(watchers, watcher)
 	}
+	return notification{publication: published, watchers: watchers}
 }
 
 func invalidate(snapshot *v1.Snapshot) {

@@ -2,6 +2,7 @@ package observer
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"sync"
 	"testing"
@@ -105,5 +106,104 @@ func TestNewRejectsOverflowingRefreshBudget(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("accepted a refresh budget larger than the maximum duration")
+	}
+}
+
+func TestFailedPrimaryCancelsSlowStandbysAndPublishes(t *testing.T) {
+	for _, mode := range []string{"request failed", "wrong role", "unavailable", "rewinding", "certificate changed"} {
+		t.Run(mode, func(t *testing.T) {
+			o, _, _ := fakeObserver(t)
+			observe(t, o) // Start with a verified, routable primary.
+			o.opts.ProbeTimeout = 5 * time.Second
+			o.opts.MaxConcurrency = 4 // Primary and standbys run concurrently.
+			o.configureProbeLimits()
+			_, _, fixtureResults := fixture()
+			standbyStarted := make(chan struct{})
+			var once sync.Once
+			o.probe = func(ctx context.Context, pod *corev1.Pod, _ v1.ConnectionParameters, _ string) (instanceStatus, error) {
+				if pod.Name != "db-1" {
+					once.Do(func() { close(standbyStarted) })
+					<-ctx.Done()
+					return instanceStatus{}, ctx.Err()
+				}
+				select {
+				case <-standbyStarted:
+				case <-ctx.Done():
+					return instanceStatus{}, ctx.Err()
+				}
+				status := fixtureResults[0].status
+				switch mode {
+				case "request failed":
+					return instanceStatus{}, errors.New("primary unreachable")
+				case "wrong role":
+					primary := false
+					status.IsPrimary = &primary
+				case "unavailable":
+					status.Unavailable = true
+				case "rewinding":
+					status.Rewinding = true
+				case "certificate changed":
+					return instanceStatus{}, &tls.CertificateVerificationError{Err: errors.New("CA rotated")}
+				}
+				return status, nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan bool, 1)
+			go func() { done <- o.observe(ctx, clusterKey{"test", "db"}) }()
+			defer cancel()
+			select {
+			case available := <-done:
+				if available {
+					t.Fatal("failed primary remained available")
+				}
+			case <-time.After(time.Second):
+				cancel()
+				<-done
+				t.Fatal("failed primary waited for the standby timeout")
+			}
+			snapshot, exists := o.store.Get("test", "db")
+			if !exists || snapshot.Available {
+				t.Fatal("probe cancellation prevented failure publication")
+			}
+			if len(o.probeSlots) != 0 || len(o.backgroundProbeSlots) != 0 {
+				t.Fatal("canceled probes retained worker capacity")
+			}
+			if mode == "certificate changed" {
+				if _, cached := o.connections.Load(clusterKey{"test", "db"}); cached {
+					t.Fatal("certificate failure did not invalidate the cached CA")
+				}
+			}
+		})
+	}
+}
+
+func TestHealthyPrimaryStillVerifiesConflictingPrimary(t *testing.T) {
+	o, _, _ := fakeObserver(t)
+	_, _, results := fixture()
+	primaryFinished := make(chan struct{})
+	o.probe = func(ctx context.Context, pod *corev1.Pod, _ v1.ConnectionParameters, _ string) (instanceStatus, error) {
+		if pod.Name == "db-1" {
+			close(primaryFinished)
+			return results[0].status, nil
+		}
+		select {
+		case <-primaryFinished:
+		case <-ctx.Done():
+			return instanceStatus{}, ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return instanceStatus{}, err
+		}
+		// A second member also claims to be primary. Successful verification of
+		// the expected primary must never skip this conflicting observation.
+		if pod.Name == "db-2" {
+			return results[0].status, nil
+		}
+		return results[2].status, nil
+	}
+	observe(t, o)
+	snapshot, exists := o.store.Get("test", "db")
+	if !exists || snapshot.Available || snapshot.Reason != "multiple_primaries_observed" {
+		t.Fatalf("conflicting primary was not checked: %+v", snapshot)
 	}
 }

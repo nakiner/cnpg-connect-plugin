@@ -28,7 +28,7 @@ defer pool.Close()
 
 Primary connections are the default. The library also supports standby policies, native pgx, `database/sql`, and Bun. See [Connect applications](#connect-applications).
 
-**Release status:** the watch-driven observer described here requires a new plugin image and chart release. Until those artifacts are published, build this checkout with the [local image and chart instructions](#run-this-checkout). The application protobuf API is unchanged. The OCI commands below use `CNPG_CONNECT_VERSION`, set to the published version you intend to install, without a leading `v`.
+The watch-driven observer and priority scheduling described here are available in plugin/image/chart **0.0.5**. The application protobuf API is compatible with `0.0.4`. The OCI commands below use `CNPG_CONNECT_VERSION`, set to the published version you intend to install, without a leading `v`.
 
 ## Install in Kubernetes
 
@@ -157,6 +157,21 @@ CNPG 1.30 does not publish actual synchronous/asynchronous replication state thr
 
 The application API is read-only and tokenless by default: anyone who can reach it can discover observed Clusters in the configured watch scope. Only public connection metadata is returned, never PostgreSQL passwords or private keys. An optional bearer token is available for deployments that want it; see [optional discovery authentication](docs/deployment.md#optional-discovery-authentication).
 
+## Performance
+
+Two live switchovers on **CNPG 1.30.0**, measured on September 18, 2026, compared plugin `0.0.4` with `0.0.5`:
+
+| Measured interval | Plugin 0.0.4 | Plugin 0.0.5 |
+| --- | ---: | ---: |
+| PostgreSQL ready → usable discovery update received | 1,573 / 2,784 ms | **154 / 148 ms** |
+| CNPG instance-manager promotion completion → discovery update received | 1,444 / 2,666 ms | **38 / 36 ms** |
+
+Each pair is the forward and return switchover. The client version, plugin resources, and CNPG lease configuration also changed; this is a before/after system comparison. The new plugin's status observations took **44 / 42 ms**; the application's new PostgreSQL sessions started about **2 ms after** a separate subscriber received the discovery update. CNPG promotion, plugin observation, and application recovery are distinct stages. Both versions used a `5s` background refresh interval; watched primary changes trigger immediate work.
+
+A separate synthetic test used **6,000 Clusters, 18,000 simulated instances, and 6,000 gRPC streams** with **2 CPUs / 2 GiB**. With warm caches, simulated 20 ms status responses, and the `5s` refresh setting, event-to-stream latency was **28.3 ms p95 / 37.8 ms p99**; the median observed refresh gap was **5.08 s**. Streams shared one in-memory transport, so this does not establish production fleet capacity or a strict 50 ms bound.
+
+Current source adds cold-start budgeting, shared immutable gRPC fan-out, and prompt cancellation after primary verification fails; these changes are not included in `0.0.5`. See the [performance guide](docs/performance.md) for the full comparison, current scalability tests, measurement boundaries, and reproducible load-test commands. Use [capacity planning](docs/deployment.md#capacity-planning) to size your deployment.
+
 ## Configuration reference
 
 See [chart/values.yaml](chart/values.yaml) for all values and [runtime flags](docs/deployment.md#runtime-flags) for process options.
@@ -175,7 +190,7 @@ See [chart/values.yaml](chart/values.yaml) for all values and [runtime flags](do
 | `observer.pollInterval`, `.ttl`, `.probeTimeout` | `5s`, `15s`, `2s` | Active Cluster status refresh, snapshot expiry/unary demand lease, and direct instance request timeout |
 | `observer.maxConcurrency` | `128` | Maximum parallel instance probes across active Clusters |
 | `observer.maxConcurrentClusters` | `32` | Whole-Cluster collections running at once; independent of the instance probe cap |
-| `observer.kubeAPIQPS`, `.kubeAPIBurst` | `20`, `40` | Kubernetes metadata/CA request limits; direct instance checks do not use this limiter |
+| `observer.kubeAPIQPS`, `.kubeAPIBurst` | `100`, `200` | Kubernetes metadata/CA request limits; direct instance checks do not use this limiter |
 | `resources.requests` | `250m`, `256Mi` | CPU and memory reserved for scheduling |
 | `resources.limits` | `2` CPUs, `1Gi` | Container limits; Go automatically adapts CPU parallelism to the CPU limit |
 | `serviceAccount.create`, `rbac.create` | `true`, `true` | Chart-managed identity and permissions |
@@ -196,7 +211,7 @@ kubectl -n cnpg-system rollout status deployment/cnpg-connect --timeout=180s
 
 `/healthz` checks process liveness; `/readyz` reports observer initialization. Querying topology confirms that a particular database currently has a usable routing view.
 
-An info-level `topology changed` log reports the Cluster, primary, member roles and sync states, availability/reason, and observation duration when routing changes. Routine freshness renewals do not produce a promotion log. The new observer's production switchover latency has not yet been measured; earlier timing measurements apply to the previous implementation.
+An info-level `topology changed` log reports the Cluster, primary, member roles and sync states, availability/reason, and observation duration when routing changes. Routine freshness renewals do not produce a promotion log. See [performance measurements](docs/performance.md#live-switchover-results) for the `0.0.4` versus `0.0.5` comparison.
 
 Upgrade using the same OCI command and values file with a new published `CNPG_CONNECT_VERSION`. Helm uses the matching image by default. Keep certificate, Gateway, and endpoint settings in your deployment configuration. Use `helm history connect -n cnpg-system` and `helm rollback connect REVISION -n cnpg-system --wait` to return to a previous Helm revision; rollback does not restore external Secrets or database state.
 

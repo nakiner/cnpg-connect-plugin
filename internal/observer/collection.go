@@ -93,24 +93,38 @@ func (o *Observer) publishFailure(ctx context.Context, key clusterKey, reason st
 
 func (o *Observer) probeInstances(ctx context.Context, pods []corev1.Pod, connection v1.ConnectionParameters, serverName string, urgent bool) []statusResult {
 	results := make([]statusResult, len(pods))
+	// The caller puts the expected primary first. If its verification fails,
+	// remaining replicas cannot make the Cluster writable. Stop their I/O but
+	// keep the outer observation alive so it can publish the failure promptly.
+	probeContext, stopProbes := context.WithCancel(ctx)
+	defer stopProbes()
 	var probes sync.WaitGroup
 	for i := range pods {
 		if !podReady(pods[i]) {
 			results[i].err = fmt.Errorf("pod not ready")
+			if i == 0 {
+				stopProbes()
+			}
 			continue
 		}
 		// Acquire before spawning: waiting instances do not create one goroutine
 		// each, and simultaneous network requests stay globally bounded.
-		release, err := o.acquireProbe(ctx, urgent)
+		release, err := o.acquireProbe(probeContext, urgent)
 		if err != nil {
 			results[i].err = err
 			continue
 		}
 		probes.Go(func() {
 			defer release()
-			probeCtx, cancel := context.WithTimeout(ctx, o.opts.ProbeTimeout)
+			probeCtx, cancel := context.WithTimeout(probeContext, o.opts.ProbeTimeout)
 			defer cancel()
 			results[i].status, results[i].err = o.probe(probeCtx, &pods[i], connection, serverName)
+			if i == 0 {
+				primary := results[i]
+				if primary.err != nil || primary.status.IsPrimary == nil || !*primary.status.IsPrimary || primary.status.Unavailable || primary.status.Rewinding {
+					stopProbes()
+				}
+			}
 		})
 	}
 	probes.Wait()

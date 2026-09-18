@@ -65,7 +65,8 @@ type Observer struct {
 	stateMu              sync.Mutex
 	observations         map[clusterKey]context.CancelCauseFunc // protected by stateMu
 	connections          sync.Map                               // clusterKey -> cachedConnection; one worker per key
-	statusClientMu       sync.Mutex
+	connectionReads      connectionReadGroup
+	statusClientMu       sync.RWMutex
 	statusClients        sync.Map // server DNS name -> *statusClientEntry
 }
 

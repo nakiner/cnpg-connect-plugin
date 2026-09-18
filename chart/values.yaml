@@ -29,9 +29,10 @@ observer:
   # reserved for urgent events. Both limits include their reserved capacity.
   maxConcurrentClusters: 32
   # Per Kubernetes client rate/burst for metadata and named public CA reads.
+  # Allows hundreds of cold CA reads without the former 20 QPS startup bottleneck.
   # Direct instance-status requests do not pass through the Kubernetes API.
-  kubeAPIQPS: 20
-  kubeAPIBurst: 40
+  kubeAPIQPS: 100
+  kubeAPIBurst: 200
 
 serviceAccount:
   create: true

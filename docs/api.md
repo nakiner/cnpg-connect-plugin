@@ -76,4 +76,4 @@ Replace `GetTopology` with `WatchTopology` for the server stream. Reflection is 
 
 Go clients import generated messages and the gRPC client from `github.com/nakiner/cnpg-connect-plugin/api/connect/v1`. This package does not import the observer or Kubernetes packages, although the plugin module declares Kubernetes dependencies. The companion [cnpgconnect-go](https://github.com/nakiner/cnpgconnect-go) library implements discovery reconnection, automatic connection defaults, role selection, and managed pgx/`database/sql`/Bun connections. Its root package is `cnpgconnectgo`.
 
-Connection metadata and tokenless defaults are new source changes; plugin `v0.0.3` predates them. Publish the updated plugin API/runtime before releasing a library version that relies on these defaults.
+Connection metadata and tokenless defaults are available from plugin `v0.0.4`; `v0.0.3` predates them. Plugin `v0.0.5` preserves that protobuf API while improving observation scheduling. `cnpgconnect-go v0.0.5` can therefore retain its `cnpg-connect-plugin v0.0.4` generated API dependency when connecting to plugin `0.0.5`.

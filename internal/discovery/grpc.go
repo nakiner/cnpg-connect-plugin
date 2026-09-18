@@ -37,11 +37,11 @@ func (s *Server) GetTopology(ctx context.Context, request *connectv1.GetTopology
 		return nil, err
 	}
 	s.store.RequestRefresh(request.Namespace, request.Name)
-	snapshot, exists := s.store.Get(request.Namespace, request.Name)
+	published, exists := s.store.getPublication(request.Namespace, request.Name)
 	if !exists {
 		return nil, status.Error(codes.NotFound, "cluster is not observed")
 	}
-	return toProto(snapshot), nil
+	return published.protobuf(), nil
 }
 
 func (s *Server) WatchTopology(request *connectv1.WatchTopologyRequest, stream connectv1.TopologyService_WatchTopologyServer) error {
@@ -52,33 +52,42 @@ func (s *Server) WatchTopology(request *connectv1.WatchTopologyRequest, stream c
 	if err := validateReference(request.GetNamespace(), request.GetName()); err != nil {
 		return err
 	}
-	updates, cancel, exists := s.store.subscribe(request.Namespace, request.Name, true)
+	updates, cancel, exists := s.store.subscribeShared(request.Namespace, request.Name)
 	if !exists {
 		return status.Error(codes.NotFound, "cluster is not observed")
 	}
 	defer cancel()
+	var lastSent uint64
 	for {
 		select {
 		case <-ctx.Done():
 			return status.FromContextError(ctx.Err()).Err()
-		case snapshot, ok := <-updates:
+		case published, ok := <-updates:
 			if !ok {
 				return nil
 			}
+			snapshot := published.snapshot
 			// A pending snapshot can expire while a slow transport applies flow
 			// control. Recheck it before delivery; clients also enforce validUntil.
 			if snapshot.Reason != "deleted" && !time.Now().Before(snapshot.ValidUntil) {
-				if latest, found := s.store.Get(snapshot.Cluster.Namespace, snapshot.Cluster.Name); found {
-					snapshot = latest
+				if latest, found := s.store.getPublication(snapshot.Cluster.Namespace, snapshot.Cluster.Name); found {
+					published = latest
 				} else {
 					continue // The queued deletion/recreation supplies the new state.
 				}
 			}
+			// The expiry lookup can jump ahead of a concurrent notification
+			// still being delivered to this mailbox. Never send that older state
+			// after the newer publication obtained directly from the store.
+			if published.order <= lastSent {
+				continue
+			}
 			// Send observes the RPC context. No per-send goroutine or unbounded
 			// event queue is created; the store coalesces pending observations.
-			if err := stream.Send(toProto(snapshot)); err != nil {
+			if err := stream.Send(published.protobuf()); err != nil {
 				return err
 			}
+			lastSent = published.order
 		}
 	}
 }

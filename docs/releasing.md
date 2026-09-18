@@ -10,9 +10,9 @@ The [release workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/wo
 
 The source tag has a leading `v`; image tags, chart versions, and chart `appVersion` omit it. The chart selects the corresponding image automatically. Chart and image use separate package paths, so their tags do not collide. No Helm repository index is needed; see [Helm OCI registries](https://helm.sh/docs/v3/topics/registries/).
 
-## Release the simplified connection setup
+## Protocol and runtime compatibility
 
-Automatic Cluster discovery, tokenless defaults, connection metadata, and Gateway h2c support are newer than plugin `v0.0.3`. Installing that old release does not enable them. Publish the plugin changes before publishing a client that requires the new generated protobuf fields:
+Automatic Cluster discovery, tokenless defaults, connection metadata, and Gateway h2c support are available from plugin `v0.0.4`; `v0.0.3` predates them. Plugin `v0.0.5` adds the watch-driven scheduling improvements without changing that protobuf API. The `cnpgconnect-go v0.0.5` client retains its `v0.0.4` generated API dependency and works with the `0.0.5` runtime. For future changes that add required protobuf fields, publish the plugin before the dependent client:
 
 1. Tag and publish a new plugin version containing the protocol, observer, runtime, and chart changes.
 2. Update `cnpgconnect-go` to require that published plugin module version, then release the client.
@@ -20,7 +20,7 @@ Automatic Cluster discovery, tokenless defaults, connection metadata, and Gatewa
 
 The API bindings are part of the plugin Go module, at `github.com/nakiner/cnpg-connect-plugin/api/connect/v1`; there is no separate protobuf module to publish. A Go source tag publishes module source, while the Actions workflow publishes the deployable image and OCI chart.
 
-Until publication, [build this checkout's image and local chart](../README.md#run-this-checkout) and build clients against the matching source checkout.
+To test future changes before publication, [build the checkout's image and local chart](../README.md#run-this-checkout) and build clients against the matching source checkout.
 
 ## Repository setup
 

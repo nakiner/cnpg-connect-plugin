@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
@@ -75,21 +76,22 @@ type statusClientEntry struct {
 	digest    [sha256.Size]byte
 	client    *http.Client
 	transport *http.Transport
-	lastUsed  time.Time // protected by statusClientMu
+	lastUsed  atomic.Int64 // Unix nanoseconds; idle transport cleanup only, not CA freshness
 }
 
 func (o *Observer) statusClient(connection v1.ConnectionParameters, serverName string) (*http.Client, error) {
 	digest := sha256.Sum256(connection.ServerCAPEM)
-	o.statusClientMu.Lock()
-	defer o.statusClientMu.Unlock()
+	o.statusClientMu.RLock()
 	if value, ok := o.statusClients.Load(serverName); ok {
 		entry := value.(*statusClientEntry)
 		if entry.digest == digest {
-			entry.lastUsed = time.Now()
+			entry.lastUsed.Store(time.Now().UnixNano())
+			o.statusClientMu.RUnlock()
 			return entry.client, nil
 		}
-		entry.transport.CloseIdleConnections()
 	}
+	o.statusClientMu.RUnlock()
+	// Parsing a new CA must not block cached clients for unrelated Clusters.
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(connection.ServerCAPEM) {
 		return nil, fmt.Errorf("invalid PostgreSQL server CA")
@@ -117,23 +119,44 @@ func (o *Observer) statusClient(connection v1.ConnectionParameters, serverName s
 			return http.ErrUseLastResponse
 		},
 	}
-	o.statusClients.Store(serverName, &statusClientEntry{
+	entry := &statusClientEntry{
 		digest:    digest,
 		client:    client,
 		transport: transport,
-		lastUsed:  time.Now(),
-	})
+	}
+	var retired *http.Transport
+	o.statusClientMu.Lock()
+	if value, ok := o.statusClients.Load(serverName); ok {
+		existing := value.(*statusClientEntry)
+		if existing.digest == digest {
+			existing.lastUsed.Store(time.Now().UnixNano())
+			o.statusClientMu.Unlock()
+			// This candidate has never made a request or opened a connection.
+			return existing.client, nil
+		}
+		retired = existing.transport
+	}
+	entry.lastUsed.Store(time.Now().UnixNano())
+	o.statusClients.Store(serverName, entry)
+	o.statusClientMu.Unlock()
+	if retired != nil {
+		retired.CloseIdleConnections()
+	}
 	return client, nil
 }
 
 func (o *Observer) closeStatusClients() {
 	o.statusClientMu.Lock()
-	defer o.statusClientMu.Unlock()
+	var retired []*http.Transport
 	o.statusClients.Range(func(key, value any) bool {
-		value.(*statusClientEntry).transport.CloseIdleConnections()
+		retired = append(retired, value.(*statusClientEntry).transport)
 		o.statusClients.Delete(key)
 		return true
 	})
+	o.statusClientMu.Unlock()
+	for _, transport := range retired {
+		transport.CloseIdleConnections()
+	}
 }
 
 // Bound retained CA/TLS state when demand ends or databases are deleted. The
@@ -147,15 +170,19 @@ func (o *Observer) pruneConnections(now time.Time) {
 		return true
 	})
 	o.statusClientMu.Lock()
-	defer o.statusClientMu.Unlock()
+	var retired []*http.Transport
 	o.statusClients.Range(func(key, value any) bool {
 		entry := value.(*statusClientEntry)
-		if now.Sub(entry.lastUsed) >= time.Minute {
-			entry.transport.CloseIdleConnections()
+		if now.Sub(time.Unix(0, entry.lastUsed.Load())) >= time.Minute {
+			retired = append(retired, entry.transport)
 			o.statusClients.Delete(key)
 		}
 		return true
 	})
+	o.statusClientMu.Unlock()
+	for _, transport := range retired {
+		transport.CloseIdleConnections()
+	}
 }
 
 func (o *Observer) readStatus(ctx context.Context, pod *corev1.Pod, connection v1.ConnectionParameters, serverName string) (instanceStatus, error) {

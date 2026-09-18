@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"hash/fnv"
+	"sync"
 	"time"
 
 	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
@@ -38,12 +39,27 @@ func (o *Observer) connectionParameters(ctx context.Context, cluster *unstructur
 	if name == "" {
 		return result, fmt.Errorf("PostgreSQL server CA not yet reported")
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, o.opts.ProbeTimeout)
-	defer cancel()
-	secret, err := o.kube.CoreV1().Secrets(cluster.GetNamespace()).Get(requestCtx, name, metav1.GetOptions{})
+	certificates, _, _ := unstructured.NestedFieldNoCopy(cluster.Object, "status", "certificates")
+	encoded, _ := json.Marshal(certificates)
+	key := connectionReadKey{namespace: cluster.GetNamespace(), secret: name, certificates: string(encoded)}
+	public, err := o.connectionReads.read(ctx, key, o.opts.ProbeTimeout, func(requestCtx context.Context) ([]byte, error) {
+		return o.readPublicCA(requestCtx, key.namespace, key.secret)
+	})
 	if err != nil {
-		return result, fmt.Errorf("read PostgreSQL server CA: %w", err)
+		return result, err
 	}
+	// Each Cluster owns its retained bytes. The shared read only deduplicates
+	// overlapping I/O; it cannot extend a Cluster's CA cache lifetime.
+	result.ServerCAPEM = append([]byte(nil), public...)
+	return result, nil
+}
+
+func (o *Observer) readPublicCA(ctx context.Context, namespace, name string) ([]byte, error) {
+	secret, err := o.kube.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("read PostgreSQL server CA: %w", err)
+	}
+	var public []byte
 	// Only serialize public certificates, even if a malformed ca.crt contains
 	// unrelated PEM blocks. Never publish other Secret keys or private material.
 	remaining := secret.Data["ca.crt"]
@@ -57,14 +73,87 @@ func (o *Observer) connectionParameters(ctx context.Context, cluster *unstructur
 			continue
 		}
 		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
-			return result, fmt.Errorf("invalid PostgreSQL server CA certificate")
+			return nil, fmt.Errorf("invalid PostgreSQL server CA certificate")
 		}
-		result.ServerCAPEM = append(result.ServerCAPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes})...)
+		public = append(public, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes})...)
 	}
-	if len(result.ServerCAPEM) == 0 {
-		return result, fmt.Errorf("PostgreSQL server CA has no public certificates")
+	if len(public) == 0 {
+		return nil, fmt.Errorf("PostgreSQL server CA has no public certificates")
 	}
-	return result, nil
+	return public, nil
+}
+
+// Only reads of the same named Secret and certificate metadata can overlap.
+// A metadata change must not join a request started for the previous view.
+type connectionReadKey struct{ namespace, secret, certificates string }
+
+type connectionRead struct {
+	done    chan struct{}
+	cancel  context.CancelFunc
+	waiters int
+	public  []byte
+	err     error
+}
+
+// connectionReadGroup retains only in-flight reads, bounded by observation
+// workers. An individual canceled observation leaves its peers running; when
+// the last waiter leaves, both the request and any API rate-limit wait stop.
+type connectionReadGroup struct {
+	mu      sync.Mutex
+	pending map[connectionReadKey]*connectionRead
+}
+
+func (g *connectionReadGroup) read(ctx context.Context, key connectionReadKey, timeout time.Duration, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	g.mu.Lock()
+	if g.pending == nil {
+		g.pending = make(map[connectionReadKey]*connectionRead)
+	}
+	call := g.pending[key]
+	if call == nil {
+		// A shared request has its own bounded lifetime rather than inheriting
+		// the first subscriber's cancellation. The last waiter cancels it.
+		requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		call = &connectionRead{done: make(chan struct{}), cancel: cancel}
+		g.pending[key] = call
+		go func() {
+			defer cancel()
+			public, err := fetch(requestCtx)
+			g.mu.Lock()
+			call.public, call.err = public, err
+			if g.pending[key] == call {
+				delete(g.pending, key)
+			}
+			close(call.done)
+			g.mu.Unlock()
+		}()
+	}
+	call.waiters++
+	g.mu.Unlock()
+	defer g.leave(key, call)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-call.done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return call.public, call.err
+	}
+}
+
+func (g *connectionReadGroup) leave(key connectionReadKey, call *connectionRead) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	call.waiters--
+	if call.waiters == 0 {
+		if g.pending[key] == call {
+			delete(g.pending, key)
+		}
+		call.cancel()
+	}
 }
 
 // Public CA material is reused between status samples. Certificate metadata
