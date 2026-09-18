@@ -36,6 +36,22 @@ func TestSecureModeRequiredByDefault(t *testing.T) {
 	}
 }
 
+func TestDiscoveryNeedsNoTokenAndCanUseGatewayTLS(t *testing.T) {
+	args := []string{"--server-cert=server.pem", "--server-key=server.key", "--client-ca=client-ca.pem"}
+	for _, discovery := range [][]string{
+		{"--discovery-cert=discovery.pem", "--discovery-key=discovery.key"},
+		{"--discovery-plaintext"},
+	} {
+		s, err := parseSettings(append(args, discovery...), io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.validate(); err != nil {
+			t.Fatalf("tokenless discovery %v: %v", discovery, err)
+		}
+	}
+}
+
 func TestInsecureModeDefaultsToLoopbackAndHonorsExplicitAddresses(t *testing.T) {
 	s, err := parseSettings([]string{"--insecure"}, io.Discard)
 	if err != nil {

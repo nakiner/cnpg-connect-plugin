@@ -70,19 +70,23 @@ func TestLiveTopologyLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("tls_bearer_auth", func(t *testing.T) {
+	t.Run("tls_discovery", func(t *testing.T) {
 		rpcCtx, rpcCancel := context.WithTimeout(ctx, 15*time.Second)
 		defer rpcCancel()
+		wantCode := codes.OK
+		if h.token != "" {
+			wantCode = codes.Unauthenticated
+		}
 		_, err := h.client.GetTopology(rpcCtx, getRequest())
-		if status.Code(err) != codes.Unauthenticated {
-			t.Fatalf("missing bearer token: expected Unauthenticated, got %v", err)
+		if status.Code(err) != wantCode {
+			t.Fatalf("Get without bearer token: expected %v, got %v", wantCode, err)
 		}
 		stream, err := h.client.WatchTopology(rpcCtx, watchRequest())
 		if err == nil {
 			_, err = stream.Recv()
 		}
-		if status.Code(err) != codes.Unauthenticated {
-			t.Fatalf("unauthenticated Watch: expected Unauthenticated, got %v", err)
+		if status.Code(err) != wantCode {
+			t.Fatalf("Watch without bearer token: expected %v, got %v", wantCode, err)
 		}
 	})
 	if t.Failed() {
@@ -270,13 +274,15 @@ func newHarness(t *testing.T, ctx context.Context) *harness {
 		t.Fatal(err)
 	}
 	h.clusters = dynamicClient.Resource(clusterResource).Namespace(clusterNamespace)
-	tokenSecret, err := h.kubernetes.CoreV1().Secrets(pluginNamespace).Get(ctx, "cnpg-connect-auth", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("read discovery token Secret: %v", err)
-	}
-	h.token = strings.TrimSpace(string(tokenSecret.Data["token"]))
-	if len(h.token) < 32 {
-		t.Fatal("discovery token Secret must contain a token of at least 32 characters")
+	if name := os.Getenv("CNPG_CONNECT_E2E_TOKEN_SECRET"); name != "" {
+		tokenSecret, err := h.kubernetes.CoreV1().Secrets(pluginNamespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("read optional discovery token Secret: %v", err)
+		}
+		h.token = strings.TrimSpace(string(tokenSecret.Data["token"]))
+		if len(h.token) < 32 {
+			t.Fatal("optional discovery token Secret must contain a token of at least 32 characters")
+		}
 	}
 	certificate, err := h.kubernetes.CoreV1().Secrets(pluginNamespace).Get(ctx, "connect-application-tls", metav1.GetOptions{})
 	if err != nil {
@@ -309,6 +315,9 @@ func (h *harness) guardContext() error {
 }
 
 func (h *harness) auth(ctx context.Context) context.Context {
+	if h.token == "" {
+		return ctx
+	}
 	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+h.token)
 }
 

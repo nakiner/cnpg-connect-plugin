@@ -22,8 +22,9 @@ import (
 const deploymentName = "connect"
 
 // TestLiveAnnotationOutage demonstrates that CNPG can fail over while the
-// optional discovery observer is absent. Unlike the lifecycle test, it leaves
-// annotation enrollment enabled and removes this plugin's native spec entry.
+// optional discovery observer is absent. Unlike the lifecycle test, it uses
+// automatic observation and removes this plugin's native spec entry.
+// The historical test and environment variable names remain compatible.
 // Other plugins and all discovery parameters remain intact.
 func TestLiveAnnotationOutage(t *testing.T) {
 	if os.Getenv("CNPG_CONNECT_E2E_ANNOTATION_OUTAGE") != "1" || os.Getenv("CNPG_CONNECT_E2E_KUBECONFIG") == "" {
@@ -60,15 +61,15 @@ func TestLiveAnnotationOutage(t *testing.T) {
 		}
 	})
 
-	enrolledAt := time.Now()
-	if err := h.enableAnnotationEnrollment(ctx); err != nil {
+	configuredAt := time.Now()
+	if err := h.useAutomaticObservation(ctx); err != nil {
 		t.Fatal(err)
 	}
-	before := h.waitGet(t, ctx, "fresh healthy annotation-enrolled topology", func(snapshot *connectv1.Snapshot) bool {
-		return healthyThree(snapshot) && snapshot.ObservedAt != nil && snapshot.ObservedAt.AsTime().After(enrolledAt.Add(2*time.Second))
+	before := h.waitGet(t, ctx, "fresh healthy automatically observed topology", func(snapshot *connectv1.Snapshot) bool {
+		return healthyThree(snapshot) && snapshot.ObservedAt != nil && snapshot.ObservedAt.AsTime().After(configuredAt.Add(2*time.Second))
 	})
-	t.Logf("annotation enrollment before outage: %s", summarize(before))
-	if err := h.assertAnnotationEnrollment(ctx); err != nil {
+	t.Logf("automatic observation before outage: %s", summarize(before))
+	if err := h.assertAutomaticObservation(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.scaleObserver(ctx, deploymentUID, 0); err != nil {
@@ -101,7 +102,7 @@ func TestLiveAnnotationOutage(t *testing.T) {
 	if err := h.verifyPod(ctx, member); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.assertAnnotationEnrollment(ctx); err != nil {
+	if err := h.assertAutomaticObservation(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.assertObserverStopped(ctx, deploymentUID); err != nil {
@@ -138,14 +139,14 @@ func TestLiveAnnotationOutage(t *testing.T) {
 	if _, err := h.waitHealthyKubernetes(recoveryCtx, oldPrimary); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.assertAnnotationEnrollment(recoveryCtx); err != nil {
+	if err := h.assertAutomaticObservation(recoveryCtx); err != nil {
 		t.Fatal(err)
 	}
-	t.Log("observer Deployment is ready again; annotation enrollment remains enabled")
+	t.Log("observer Deployment is ready again; automatic observation remains enabled")
 	t.Log("restart any Pod-bound port forward and verify GetTopology/WatchTopology against the recovered observer")
 }
 
-func (h *harness) enableAnnotationEnrollment(ctx context.Context) error {
+func (h *harness) useAutomaticObservation(ctx context.Context) error {
 	var preserved map[string]string
 	cluster, err := h.clusters.Get(ctx, clusterName, metav1.GetOptions{})
 	if err != nil {
@@ -201,14 +202,14 @@ func (h *harness) enableAnnotationEnrollment(ctx context.Context) error {
 		}
 		return map[string]interface{}{
 			"metadata": map[string]interface{}{"resourceVersion": current.GetResourceVersion(), "annotations": map[string]interface{}{
-				"connect.cnpg.io/enabled": "true", "connect.cnpg.io/parameters": string(encoded),
+				"connect.cnpg.io/enabled": nil, "connect.cnpg.io/parameters": string(encoded),
 			}},
 			"spec": map[string]interface{}{"plugins": remaining},
 		}
 	})
 }
 
-func (h *harness) assertAnnotationEnrollment(ctx context.Context) error {
+func (h *harness) assertAutomaticObservation(ctx context.Context) error {
 	cluster, err := h.clusters.Get(ctx, clusterName, metav1.GetOptions{})
 	if err != nil {
 		return err
@@ -216,8 +217,8 @@ func (h *harness) assertAnnotationEnrollment(ctx context.Context) error {
 	if cluster.GetUID() != h.clusterUID {
 		return fmt.Errorf("test Cluster identity changed")
 	}
-	if cluster.GetAnnotations()["connect.cnpg.io/enabled"] != "true" {
-		return fmt.Errorf("annotation enrollment is no longer enabled")
+	if _, exists := cluster.GetAnnotations()["connect.cnpg.io/enabled"]; exists {
+		return fmt.Errorf("automatic observation must not depend on an enabled annotation")
 	}
 	plugins, _, _ := unstructured.NestedSlice(cluster.Object, "spec", "plugins")
 	for _, value := range plugins {

@@ -28,6 +28,10 @@ rules:
   - apiGroups: [""]
     resources: [pods/proxy]
     verbs: [get]
+  - apiGroups: [""]
+    # Only named PostgreSQL CA Secrets are fetched; no Secret list/watch.
+    resources: [secrets]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: {{ if .Values.watchNamespace }}RoleBinding{{ else }}ClusterRoleBinding{{ end }}

@@ -44,9 +44,15 @@ spec:
             - --server-cert=/tls/plugin/tls.crt
             - --server-key=/tls/plugin/tls.key
             - --client-ca=/tls/client/ca.crt
+            {{- if .Values.tls.application.enabled }}
             - --discovery-cert=/tls/application/tls.crt
             - --discovery-key=/tls/application/tls.key
+            {{- else }}
+            - --discovery-plaintext
+            {{- end }}
+            {{- if .Values.application.auth.existingSecret }}
             - --auth-token-file=/auth/token
+            {{- end }}
             - --poll-interval={{ .Values.observer.pollInterval }}
             - --ttl={{ .Values.observer.ttl }}
             - --probe-timeout={{ .Values.observer.probeTimeout }}
@@ -93,12 +99,16 @@ spec:
             - name: client-ca
               mountPath: /tls/client
               readOnly: true
+            {{- if .Values.tls.application.enabled }}
             - name: application-tls
               mountPath: /tls/application
               readOnly: true
+            {{- end }}
+            {{- if .Values.application.auth.existingSecret }}
             - name: auth
               mountPath: /auth
               readOnly: true
+            {{- end }}
       volumes:
         - name: plugin-tls
           secret:
@@ -116,6 +126,7 @@ spec:
             items:
               - key: {{ .Values.tls.plugin.clientCAKey }}
                 path: ca.crt
+        {{- if .Values.tls.application.enabled }}
         - name: application-tls
           secret:
             secretName: {{ include "connect.applicationSecret" . }}
@@ -125,13 +136,16 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
+        {{- end }}
+        {{- if .Values.application.auth.existingSecret }}
         - name: auth
           secret:
-            secretName: {{ required "application.auth.existingSecret is required" .Values.application.auth.existingSecret }}
+            secretName: {{ .Values.application.auth.existingSecret }}
             defaultMode: 0440
             items:
               - key: {{ .Values.application.auth.key }}
                 path: token
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

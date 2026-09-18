@@ -1,91 +1,98 @@
 # Publishing the image and OCI chart
 
-The [release GitHub Actions workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml) publishes two versioned packages from one Git tag:
+The [release workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml) publishes two packages from a versioned Git tag:
 
-| Artifact | For source tag `v0.0.1` |
+| Artifact | Reference |
 | --- | --- |
-| Multi-architecture image | `ghcr.io/nakiner/cnpg-connect-plugin:0.0.1` |
-| Helm OCI chart | `oci://ghcr.io/nakiner/charts/cnpg-connect-plugin`, version `0.0.1` |
-| Chart application version | `0.0.1` |
+| Container image | `ghcr.io/nakiner/cnpg-connect-plugin:VERSION` |
+| Helm OCI chart | `oci://ghcr.io/nakiner/charts/cnpg-connect-plugin`, version `VERSION` |
 | Image platforms | `linux/amd64`, `linux/arm64` |
 
-The leading `v` belongs to the source tag only. The workflow checks out that exact tagged source, derives chart `version` and `appVersion` from the tag, and packages the chart with the corresponding GHCR image defaults. This also allows the existing `v0.0.1` tag to be released even though its checked-in chart used earlier development defaults. It does not move the Git tag or change its source tree.
+The source tag has a leading `v`; image tags, chart versions, and chart `appVersion` omit it. The chart selects the corresponding image automatically. Chart and image use separate package paths, so their tags do not collide. No Helm repository index is needed; see [Helm OCI registries](https://helm.sh/docs/v3/topics/registries/).
 
-The image and chart use different package paths so their OCI tags do not collide. Installation uses the full chart path; `helm repo add` and a GitHub Pages chart index are unnecessary. See [Helm's OCI registry documentation](https://helm.sh/docs/v3/topics/registries/).
+## Release the simplified connection setup
+
+Automatic Cluster discovery, tokenless defaults, connection metadata, and Gateway h2c support are newer than plugin `v0.0.3`. Installing that old release does not enable them. Publish the plugin changes before publishing a client that requires the new generated protobuf fields:
+
+1. Tag and publish a new plugin version containing the protocol, observer, runtime, and chart changes.
+2. Update `cnpgconnect-go` to require that published plugin module version, then release the client.
+3. Update application dependencies and deploy the matching plugin/chart configuration.
+
+The API bindings are part of the plugin Go module, at `github.com/nakiner/cnpg-connect-plugin/api/connect/v1`; there is no separate protobuf module to publish. A Go source tag publishes module source, while the Actions workflow publishes the deployable image and OCI chart.
+
+Until publication, [build this checkout's image and local chart](../README.md#run-this-checkout) and build clients against the matching source checkout.
 
 ## Repository setup
 
-1. Commit and push the release workflow, packaging helper, and related changes to the repository's default branch. Manual dispatch must be available from that branch.
-2. Ensure Actions and GitHub Packages publishing are allowed by repository/organization policy.
-3. The workflow requests `contents: read` and `packages: write` and authenticates using the repository's `GITHUB_TOKEN`. No custom PAT or registry-password repository secret is needed for publishing.
-4. If either package already exists and is not associated with this repository, connect it or grant this repository Actions write access in the package settings before publishing.
+The workflow uses `GITHUB_TOKEN` with `contents: read` and `packages: write`; no custom registry-password Secret is needed. Repository/organization policy must allow Actions and package publication. If packages already exist outside this repository's ownership, connect them or grant the repository Actions write access in their settings. See [GitHub package workflow authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-in-a-github-actions-workflow).
 
-GitHub documents [workflow token authentication and package access](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-in-a-github-actions-workflow). A workflow cannot override an organization policy that forbids publication.
+## Publish a version
 
-## Publish v0.0.1
+Set `CNPG_CONNECT_VERSION` to the semantic version being released, without the leading `v`, then tag the committed source and push:
 
-For this initial release, you can recreate `v0.0.1` at the commit containing the release workflow and packaging changes, then push that tag. The tag event starts publication automatically. Commit the changes before retagging so the tagged source contains the workflow.
+```sh
+git tag -a "v${CNPG_CONNECT_VERSION:?Set the new release version}" \
+  -m "Release v${CNPG_CONNECT_VERSION}"
+git push origin "v${CNPG_CONNECT_VERSION}"
+```
 
-Alternatively, keep the existing tag unchanged and publish it manually. Merely pushing an unchanged existing tag does not create another tag-push event, and a workflow added afterward is not retroactively triggered. After the workflow is on the default branch:
+The tagged source must contain the workflow. Prerelease suffixes are supported; `+build` metadata is not. The workflow derives packaged chart/image versions from the tag, so release packaging does not require changing every checked-in version field.
 
-1. Open the [release workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml).
-2. Select **Run workflow**, use the default branch containing this workflow, and set the **tag** input to `v0.0.1`.
-3. Run it and wait for the image and chart publication steps to succeed.
-4. Check both package versions under the repository/account's **Packages** page.
+For an existing tag or a failed publication, open [the workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml), choose **Run workflow**, and set its **tag** input. The workflow definition, Dockerfile, and packaging helper come from the selected branch; application and chart source come from the requested tag. The workflow does not move the tag. See [manual workflow runs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
 
-With manual dispatch, the workflow definition, Dockerfile, and chart-packaging helper come from the selected default branch; the application and chart source come from the requested tag. The build injects the release version into the binary, including when publishing a tag that predates version injection. See [GitHub's manual workflow instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+Use a new version for changed source already distributed to users. A rerun republishes that version and does not enforce registry immutability. Image and chart publication is not atomic; a failed run may leave only one artifact available.
 
-A published Git source tag by itself does not mean these packages exist. The OCI installation commands work once publication has completed and the caller has package access.
+## Registry access
 
-## Make installation public, or configure private access
+Make both packages public for anonymous installation:
 
-GHCR packages are private when first published. Change the visibility of **both** packages to public for anonymous chart downloads and container pulls:
+- `cnpg-connect-plugin` — image.
+- `charts/cnpg-connect-plugin` — chart.
 
-- `cnpg-connect-plugin` — the application image.
-- `charts/cnpg-connect-plugin` — the Helm chart.
+A public repository does not automatically make its GHCR packages public. Configure their visibility on [the Packages page](https://github.com/nakiner?tab=packages); see [GitHub package access settings](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
 
-A public GitHub repository does not automatically make these packages public. Find both on [nakiner's Packages page](https://github.com/nakiner?tab=packages), open each package's settings, and review its access/visibility configuration. See [GitHub's package visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+For private packages, authenticate the workstation's Helm client:
 
-If packages should remain private, installers need Helm registry credentials for the chart and Kubernetes `imagePullSecrets` for the image. The [README private-registry instructions](../README.md#1-check-the-release-and-registry-access) describe both. Making the chart public alone does not allow a cluster to pull a private image.
+```sh
+helm registry login ghcr.io --username YOUR_GITHUB_USERNAME
+```
+
+Use a personal access token (classic) with `read:packages` and package access at the password prompt. See [GHCR authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-with-a-personal-access-token-classic).
+
+Kubernetes nodes need separate image pull credentials. Create a Secret from your secret manager's Docker-format authentication file, then reference it in Helm values:
+
+```sh
+kubectl -n cnpg-system create secret generic ghcr-pull \
+  --type=kubernetes.io/dockerconfigjson \
+  --from-file=.dockerconfigjson=/secure/path/ghcr-config.json
+```
+
+```yaml
+imagePullSecrets:
+  - name: ghcr-pull
+```
+
+Helm login does not create this Kubernetes Secret. Public packages require neither set of registry credentials. Registry credentials are also unrelated to the optional discovery bearer token.
 
 ## Verify publication
 
-With package access configured, inspect the chart and its default image selection:
-
 ```sh
-helm show chart oci://ghcr.io/nakiner/charts/cnpg-connect-plugin --version 0.0.1
-helm show values oci://ghcr.io/nakiner/charts/cnpg-connect-plugin --version 0.0.1
-helm template connect oci://ghcr.io/nakiner/charts/cnpg-connect-plugin \
-  --version 0.0.1 --namespace cnpg-system
+helm show chart oci://ghcr.io/nakiner/charts/cnpg-connect-plugin \
+  --version "${CNPG_CONNECT_VERSION:?Set the published release version}"
+helm show values oci://ghcr.io/nakiner/charts/cnpg-connect-plugin \
+  --version "$CNPG_CONNECT_VERSION"
+docker buildx imagetools inspect \
+  "ghcr.io/nakiner/cnpg-connect-plugin:${CNPG_CONNECT_VERSION}"
 ```
 
-Expect chart `version` and `appVersion` to be `0.0.1`, and the rendered Deployment image to be `ghcr.io/nakiner/cnpg-connect-plugin:0.0.1` without a consumer image override.
-
-For a maintainer with Docker/buildx installed, inspect the image manifest:
-
-```sh
-docker buildx imagetools inspect ghcr.io/nakiner/cnpg-connect-plugin:0.0.1
-```
-
-Confirm that it includes `linux/amd64` and `linux/arm64`. The workflow summary records the source tag/commit, image reference/digest, and chart reference/version. Package publication does not deploy the plugin or establish Kubernetes runtime behavior; follow the [installation and verification guide](../README.md#install-in-kubernetes).
-
-## Subsequent releases
-
-Choose a new semantic version and push a new `v`-prefixed tag from the commit being released. Prerelease suffixes are supported; `+build` metadata is not supported by this workflow. For example, once `0.0.2` is ready:
-
-```sh
-git tag -a v0.0.2 -m 'Release v0.0.2'
-git push origin v0.0.2
-```
-
-The tagged commit must contain the release workflow for automatic tag-push publication. The workflow derives chart/image versions from the tag; manually editing all version fields is not required for packaging. New release tags should remain fixed. Use a new version for source changes and keep installations pinned to the desired chart `--version`.
-
-The workflow can also be dispatched with an existing release tag for initial publication or recovery of a failed run. A rerun rebuilds and republishes that version; the workflow does not enforce registry tag immutability. Use a new version for changes to an already distributed release. Inspect the failed step and any already-published packages before retrying. Publishing the image and chart is not a single atomic registry operation, so a failed run can leave only one artifact available.
+Chart `version` and `appVersion` should match the chosen version; its Deployment uses the matching image. The image manifest should include both supported architectures. The workflow summary records the tag, commit, image digest, and chart version. Publication does not deploy a cluster; use the [installation guide](../README.md#install-in-kubernetes).
 
 ## Validate workflow changes locally
 
-Install [ShellCheck](https://github.com/koalaman/shellcheck#installing) before running the workflow checks. Actionlint [skips ShellCheck when it cannot find it](https://github.com/rhysd/actionlint/blob/main/docs/checks.md#shellcheck-integration-for-run), so an actionlint-only pass can miss diagnostics reported by GitHub's Ubuntu runner. Use the same prerequisite check as CI:
+Actionlint uses ShellCheck when available; CI's Ubuntu runner has it. Install [ShellCheck](https://github.com/koalaman/shellcheck#installing), then run:
 
 ```sh
 shellcheck --version && go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
 ```
+
+Workflow action references use major-version tags (`@v7`, `@v5`, and so on), following this repository's convention.

@@ -31,7 +31,8 @@ chart-check:
 	$(HELM) template connect chart --namespace cnpg-system -f examples/values-existing-secrets.yaml > /dev/null
 	$(HELM) template connect chart --namespace cnpg-system --set observer.kubeAPIQPS=50 --set observer.kubeAPIBurst=100 > /dev/null
 	@if $(HELM) template connect chart --set tls.certManager.enabled=false >/dev/null 2>&1; then echo "Missing TLS Secrets must fail validation"; exit 1; fi
-	@if $(HELM) template connect chart --set application.auth.existingSecret= >/dev/null 2>&1; then echo "Missing token Secret must fail validation"; exit 1; fi
+	$(HELM) template connect chart --set application.auth.existingSecret=legacy-discovery-token > /dev/null
+	$(HELM) template connect chart --set tls.application.enabled=false > /dev/null
 	@if $(HELM) template connect chart --set observer.kubeAPIQPS=0 >/dev/null 2>&1; then echo "Zero API QPS must fail validation"; exit 1; fi
 	@if $(HELM) template connect chart --set observer.kubeAPIBurst=0 >/dev/null 2>&1; then echo "Zero API burst must fail validation"; exit 1; fi
 

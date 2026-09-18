@@ -199,6 +199,7 @@ func invalidate(snapshot *v1.Snapshot) {
 }
 
 func clone(snapshot v1.Snapshot) v1.Snapshot {
+	snapshot.Connection.ServerCAPEM = append([]byte(nil), snapshot.Connection.ServerCAPEM...)
 	members := make([]v1.Member, len(snapshot.Members))
 	for i, member := range snapshot.Members {
 		members[i] = member

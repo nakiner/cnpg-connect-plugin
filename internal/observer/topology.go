@@ -24,6 +24,9 @@ func primaryNames(cluster *unstructured.Unstructured) (string, string) {
 }
 
 func parameters(cluster *unstructured.Unstructured) (bool, config.Parameters, error) {
+	if cluster.GetAnnotations()[config.EnabledAnnotation] == "false" {
+		return false, config.Parameters{}, nil
+	}
 	plugins, _, err := unstructured.NestedSlice(cluster.Object, "spec", "plugins")
 	if err != nil {
 		return false, config.Parameters{}, err
@@ -45,19 +48,16 @@ func parameters(cluster *unstructured.Unstructured) (bool, config.Parameters, er
 		parsed, err := config.ParseParameters(values)
 		return true, parsed, err
 	}
-	// Annotation enrollment keeps discovery out of CNPG's synchronous plugin
-	// call path. Explicit native plugin configuration (including disabled) wins.
-	if cluster.GetAnnotations()[config.EnabledAnnotation] == "true" {
-		values := map[string]string{}
-		if raw := cluster.GetAnnotations()[config.ParametersAnnotation]; raw != "" {
-			if err := json.Unmarshal([]byte(raw), &values); err != nil {
-				return true, config.Parameters{}, fmt.Errorf("invalid %s: %w", config.ParametersAnnotation, err)
-			}
+	// Every Cluster in the watch scope is observed by default. Parameters can
+	// be supplied without adding this observer to CNPG's synchronous plugin path.
+	values := map[string]string{}
+	if raw := cluster.GetAnnotations()[config.ParametersAnnotation]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &values); err != nil {
+			return true, config.Parameters{}, fmt.Errorf("invalid %s: %w", config.ParametersAnnotation, err)
 		}
-		parsed, err := config.ParseParameters(values)
-		return true, parsed, err
 	}
-	return false, config.Parameters{}, nil
+	parsed, err := config.ParseParameters(values)
+	return true, parsed, err
 }
 
 func podReady(pod corev1.Pod) bool {
@@ -112,6 +112,9 @@ func buildSnapshot(cluster *unstructured.Unstructured, pods []corev1.Pod, result
 			m.Endpoints["internal"] = v1.Endpoint{Host: pod.Status.PodIP, Port: 5432, ServerName: serverName}
 		}
 		if endpoint, ok := params.ExternalEndpoints[pod.Name]; ok {
+			if endpoint.ServerName == "" {
+				endpoint.ServerName = serverName
+			}
 			m.Endpoints["external"] = endpoint
 		}
 		r := results[i]

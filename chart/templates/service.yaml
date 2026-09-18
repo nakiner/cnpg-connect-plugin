@@ -44,3 +44,6 @@ spec:
       port: {{ .Values.application.service.port }}
       targetPort: discovery
       protocol: TCP
+      {{- if not .Values.tls.application.enabled }}
+      appProtocol: kubernetes.io/h2c
+      {{- end }}

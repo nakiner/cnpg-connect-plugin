@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"testing"
@@ -14,6 +15,40 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
+
+func TestGRPCTokenlessConnectionDefaults(t *testing.T) {
+	s := NewStore()
+	input := sampleSnapshot()
+	input.Connection.Database = "app"
+	input.Connection.ServerCAPEM = []byte("public CA")
+	s.Put(input)
+	client := testClient(t, s, "")
+	ctx := rpcContext(t)
+	got, err := client.GetTopology(ctx, &connectv1.GetTopologyRequest{Namespace: "database", Name: "postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetConnection().GetDatabase() != "app" || !bytes.Equal(got.GetConnection().GetServerCaPem(), input.Connection.ServerCAPEM) {
+		t.Fatal("tokenless Get lost public connection defaults")
+	}
+	stream, err := client.WatchTopology(ctx, &connectv1.WatchTopologyRequest{Namespace: "database", Name: "postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.Connection.ServerCAPEM = []byte("rotated public CA")
+	s.Put(input)
+	rotated, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.Revision == initial.Revision || !bytes.Equal(rotated.GetConnection().GetServerCaPem(), input.Connection.ServerCAPEM) {
+		t.Fatal("tokenless watch did not carry CA rotation")
+	}
+}
 
 func testClient(t *testing.T, store *Store, token string) connectv1.TopologyServiceClient {
 	t.Helper()

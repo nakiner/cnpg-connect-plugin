@@ -80,6 +80,8 @@ func TestStoreRoutingChangesBumpRevision(t *testing.T) {
 		"primary":             func(s *v1.Snapshot) { s.PrimaryID = "pod-2" },
 		"transition":          func(s *v1.Snapshot) { s.Transitioning = true },
 		"availability":        func(s *v1.Snapshot) { s.Available = false },
+		"database":            func(s *v1.Snapshot) { s.Connection.Database = "rent" },
+		"server CA":           func(s *v1.Snapshot) { s.Connection.ServerCAPEM = []byte("new public CA") },
 	}
 	for name, change := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -198,6 +200,7 @@ func TestStoreDeletionAndRecreation(t *testing.T) {
 func TestStoreCopiesInputsOutputsAndEachDelivery(t *testing.T) {
 	s := NewStore()
 	input := sampleSnapshot()
+	input.Connection.ServerCAPEM = []byte("public CA")
 	s.Put(input)
 	a, cancelA := s.Subscribe("database", "postgres")
 	defer cancelA()
@@ -205,20 +208,23 @@ func TestStoreCopiesInputsOutputsAndEachDelivery(t *testing.T) {
 	defer cancelB()
 	input.Members[0].Name = "modified"
 	input.Members[0].Endpoints["internal"] = v1.Endpoint{Host: "modified"}
+	input.Connection.ServerCAPEM[0] = 'x'
 	first := latest(t, a)
 	first.Members[0].Name = "modified-again"
 	first.Members[0].Endpoints["internal"] = v1.Endpoint{Host: "modified-again"}
+	first.Connection.ServerCAPEM[0] = 'y'
 	second := latest(t, b)
 	got, _ := s.Get("database", "postgres")
 	for _, snapshot := range []v1.Snapshot{second, got} {
-		if snapshot.Members[0].Name != "postgres-1" || snapshot.Members[0].Endpoints["internal"].Host != "10.1.1.1" {
+		if snapshot.Members[0].Name != "postgres-1" || snapshot.Members[0].Endpoints["internal"].Host != "10.1.1.1" || string(snapshot.Connection.ServerCAPEM) != "public CA" {
 			t.Fatal("snapshot ownership leaked")
 		}
 	}
 	got.Members[0].Endpoints["internal"] = v1.Endpoint{Host: "changed-get"}
+	got.Connection.ServerCAPEM[0] = 'z'
 	gotAgain, _ := s.Get("database", "postgres")
-	if gotAgain.Members[0].Endpoints["internal"].Host != "10.1.1.1" {
-		t.Fatal("Get leaked stored endpoint map")
+	if gotAgain.Members[0].Endpoints["internal"].Host != "10.1.1.1" || string(gotAgain.Connection.ServerCAPEM) != "public CA" {
+		t.Fatal("Get leaked stored endpoint map or CA bytes")
 	}
 }
 

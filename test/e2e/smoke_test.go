@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestLiveTopologySmoke is read-only and supports either enrollment mode. It is
+// TestLiveTopologySmoke is read-only and supports automatic observation. It is
 // suitable after restarting a port forward following observer Pod replacement.
 func TestLiveTopologySmoke(t *testing.T) {
 	if os.Getenv("CNPG_CONNECT_E2E_KUBECONFIG") == "" {
@@ -39,5 +39,5 @@ func TestLiveTopologySmoke(t *testing.T) {
 	if !healthyThree(initial) || initial.Cluster == nil || initial.Cluster.Uid != current.Cluster.Uid || initial.PrimaryId != current.PrimaryId {
 		t.Fatalf("WatchTopology initial snapshot differs from healthy GetTopology state: %s", summarize(initial))
 	}
-	t.Logf("authenticated TLS GetTopology and WatchTopology recovered: %s", summarize(initial))
+	t.Logf("TLS GetTopology and WatchTopology recovered: %s", summarize(initial))
 }

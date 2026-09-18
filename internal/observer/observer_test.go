@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nakiner/cnpg-connect-plugin/internal/config"
 	"github.com/nakiner/cnpg-connect-plugin/internal/discovery"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,10 +29,14 @@ import (
 func fakeObserver(t *testing.T) (*Observer, *kubefake.Clientset, *fake.FakeDynamicClient) {
 	t.Helper()
 	cluster, pods, results := fixture()
+	unstructured.RemoveNestedField(cluster.Object, "spec", "plugins")
+	_ = unstructured.SetNestedField(cluster.Object, "db-ca", "status", "certificates", "serverCASecret")
+	_ = unstructured.SetNestedField(cluster.Object, "app", "spec", "bootstrap", "initdb", "database")
 	objects := make([]runtime.Object, len(pods))
 	for i := range pods {
 		objects[i] = &pods[i]
 	}
+	objects = append(objects, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test"}, Data: map[string][]byte{"ca.crt": testPublicCA(t)}})
 	kube := kubefake.NewSimpleClientset(objects...)
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{clusterResource: "ClusterList"}, cluster)
 	o, err := New(kube, dyn, discovery.NewStore(), Options{PollInterval: time.Second, TTL: 10 * time.Second, ProbeTimeout: time.Second, MaxConcurrency: 2}, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -49,7 +54,7 @@ func fakeObserver(t *testing.T) (*Observer, *kubefake.Clientset, *fake.FakeDynam
 	return o, kube, dyn
 }
 
-func TestCollectEnrollAndDelete(t *testing.T) {
+func TestCollectAutomaticallyAndDelete(t *testing.T) {
 	o, _, dyn := fakeObserver(t)
 	if err := o.collect(context.Background()); err != nil {
 		t.Fatal(err)
@@ -66,6 +71,36 @@ func TestCollectEnrollAndDelete(t *testing.T) {
 	}
 	if _, ok := o.store.Get("test", "db"); ok {
 		t.Fatal("deleted cluster remains discoverable")
+	}
+}
+
+func TestExplicitOptOutRemovesAutomaticallyObservedCluster(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		t.Run(fmt.Sprintf("native=%v", native), func(t *testing.T) {
+			o, _, dyn := fakeObserver(t)
+			ctx := context.Background()
+			if err := o.collect(ctx); err != nil {
+				t.Fatal(err)
+			}
+			cluster, err := dyn.Resource(clusterResource).Namespace("test").Get(ctx, "db", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if native {
+				_ = unstructured.SetNestedSlice(cluster.Object, []any{map[string]any{"name": config.PluginName, "enabled": false}}, "spec", "plugins")
+			} else {
+				cluster.SetAnnotations(map[string]string{config.EnabledAnnotation: "false"})
+			}
+			if _, err := dyn.Resource(clusterResource).Namespace("test").Update(ctx, cluster, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := o.collect(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := o.store.Get("test", "db"); exists {
+				t.Fatal("opted-out cluster remains discoverable")
+			}
+		})
 	}
 }
 

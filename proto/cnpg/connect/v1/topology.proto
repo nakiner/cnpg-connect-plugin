@@ -76,6 +76,15 @@ message Member {
   string replay_lsn = 12;
 }
 
+// PostgreSQL connection defaults discovered by the plugin. Contains no login
+// credentials or private keys. Applications authenticate directly to PostgreSQL.
+message ConnectionParameters {
+  // Application database configured during cluster bootstrap; empty when unknown.
+  string database = 1;
+  // Public PostgreSQL server CA bundle in PEM format.
+  bytes server_ca_pem = 2;
+}
+
 message Snapshot {
   string api_version = 1;
   ClusterRef cluster = 2;
@@ -91,4 +100,5 @@ message Snapshot {
   string primary_id = 8;
   bool transitioning = 9;
   repeated Member members = 10;
+  ConnectionParameters connection = 11;
 }

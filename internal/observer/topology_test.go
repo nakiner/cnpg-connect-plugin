@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
 	"github.com/nakiner/cnpg-connect-plugin/internal/config"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +47,18 @@ func TestBuildSnapshotClassifiesObservedStates(t *testing.T) {
 				t.Fatal("missing TLS identity")
 			}
 		})
+	}
+}
+
+func TestExternalEndpointsInheritPostgresCertificateName(t *testing.T) {
+	cluster, pods, results := fixture()
+	params := config.Parameters{ExternalEndpoints: map[string]v1.Endpoint{
+		"db-1": {Host: "primary.example.test", Port: 5432},
+		"db-2": {Host: "standby.example.test", Port: 5432, ServerName: "custom.example.test"},
+	}}
+	got := buildSnapshot(cluster, pods, results, params, time.Now(), 15*time.Second)
+	if got.Members[0].Endpoints["external"].ServerName != "db-rw.test.svc" || got.Members[1].Endpoints["external"].ServerName != "custom.example.test" {
+		t.Fatal("external PostgreSQL TLS identities did not use discovered defaults or explicit override")
 	}
 }
 
@@ -156,28 +169,38 @@ func TestDecodeStatusRejectsMissingAndMalformedData(t *testing.T) {
 	}
 }
 
-func TestEnrollment(t *testing.T) {
+func TestAutomaticObservationAndExplicitOptOut(t *testing.T) {
 	c, _, _ := fixture()
 	if enabled, _, err := parameters(c); !enabled || err != nil {
 		t.Fatalf("enabled=%v err=%v", enabled, err)
 	}
+	c.SetAnnotations(map[string]string{config.EnabledAnnotation: "false"})
+	if enabled, _, _ := parameters(c); enabled {
+		t.Fatal("native registration overrode explicit observation opt-out")
+	}
+	c.SetAnnotations(nil)
 	_ = unstructured.SetNestedSlice(c.Object, []any{map[string]any{"name": config.PluginName, "enabled": false}}, "spec", "plugins")
 	if enabled, _, _ := parameters(c); enabled {
-		t.Fatal("enrolled disabled cluster")
+		t.Fatal("observed explicitly disabled cluster")
 	}
 	c.SetAnnotations(map[string]string{config.EnabledAnnotation: "true"})
 	if enabled, _, _ := parameters(c); enabled {
 		t.Fatal("annotation overrode explicit disabled plugin")
 	}
 	unstructured.RemoveNestedField(c.Object, "spec", "plugins")
+	c.SetAnnotations(nil)
 	if enabled, _, err := parameters(c); !enabled || err != nil {
-		t.Fatalf("annotation enrollment failed: enabled=%v err=%v", enabled, err)
+		t.Fatalf("automatic observation failed: enabled=%v err=%v", enabled, err)
 	}
-	c.SetAnnotations(map[string]string{config.EnabledAnnotation: "true", config.ParametersAnnotation: `{"serverName":"custom.example.test"}`})
+	c.SetAnnotations(map[string]string{config.EnabledAnnotation: "false"})
+	if enabled, _, _ := parameters(c); enabled {
+		t.Fatal("observed annotation-disabled cluster")
+	}
+	c.SetAnnotations(map[string]string{config.ParametersAnnotation: `{"serverName":"custom.example.test"}`})
 	if enabled, p, err := parameters(c); !enabled || err != nil || p.ServerName != "custom.example.test" {
 		t.Fatalf("annotation parameters failed: %+v %v", p, err)
 	}
-	c.SetAnnotations(map[string]string{config.EnabledAnnotation: "true", config.ParametersAnnotation: `not-json`})
+	c.SetAnnotations(map[string]string{config.ParametersAnnotation: `not-json`})
 	if enabled, _, err := parameters(c); !enabled || err == nil {
 		t.Fatal("malformed annotation did not fail closed")
 	}

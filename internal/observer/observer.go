@@ -212,6 +212,12 @@ func (o *Observer) collectCluster(ctx context.Context, cluster *unstructured.Uns
 		publishFailure("kubernetes_unavailable")
 		return
 	}
+	connection, err := o.connectionParameters(ctx, cluster)
+	if err != nil {
+		o.log.Warn("connection defaults unavailable", "namespace", cluster.GetNamespace(), "cluster", cluster.GetName(), "error", err)
+		publishFailure("connection_defaults_unavailable")
+		return
+	}
 	results := make([]statusResult, len(pods))
 	var probes sync.WaitGroup
 	for i := range pods {
@@ -246,7 +252,7 @@ func (o *Observer) collectCluster(ctx context.Context, cluster *unstructured.Uns
 	current, target := primaryNames(cluster)
 	newCurrent, newTarget := primaryNames(latest)
 	enabled, latestParams, paramErr := parameters(latest)
-	if !enabled || paramErr != nil || !reflect.DeepEqual(params, latestParams) || latest.GetUID() != cluster.GetUID() || latest.GetGeneration() != cluster.GetGeneration() || latest.GetDeletionTimestamp() != nil || current != newCurrent || target != newTarget || latest.GetAnnotations()["cnpg.io/fencedInstances"] != cluster.GetAnnotations()["cnpg.io/fencedInstances"] {
+	if !enabled || paramErr != nil || !reflect.DeepEqual(params, latestParams) || latest.GetUID() != cluster.GetUID() || latest.GetGeneration() != cluster.GetGeneration() || latest.GetDeletionTimestamp() != nil || current != newCurrent || target != newTarget || latest.GetAnnotations()["cnpg.io/fencedInstances"] != cluster.GetAnnotations()["cnpg.io/fencedInstances"] || serverCASecret(latest) != serverCASecret(cluster) {
 		publishFailure("topology_changed_during_observation")
 		o.Notify()
 		return
@@ -261,7 +267,9 @@ func (o *Observer) collectCluster(ctx context.Context, cluster *unstructured.Uns
 		o.Notify()
 		return
 	}
-	o.store.Put(buildSnapshot(cluster, pods, results, params, at, o.opts.TTL))
+	snapshot := buildSnapshot(cluster, pods, results, params, at, o.opts.TTL)
+	snapshot.Connection = connection
+	o.store.Put(snapshot)
 }
 
 func sameMembers(a, b []corev1.Pod) bool {
@@ -288,7 +296,7 @@ func relevantChange(old, new any) bool {
 		}
 		ap, at := primaryNames(a)
 		bp, bt := primaryNames(b)
-		return a.GetUID() != b.GetUID() || a.GetGeneration() != b.GetGeneration() || ap != bp || at != bt || !reflect.DeepEqual(a.GetAnnotations(), b.GetAnnotations()) || !reflect.DeepEqual(a.GetDeletionTimestamp(), b.GetDeletionTimestamp())
+		return a.GetUID() != b.GetUID() || a.GetGeneration() != b.GetGeneration() || ap != bp || at != bt || serverCASecret(a) != serverCASecret(b) || !reflect.DeepEqual(a.GetAnnotations(), b.GetAnnotations()) || !reflect.DeepEqual(a.GetDeletionTimestamp(), b.GetDeletionTimestamp())
 	default:
 		return true
 	}

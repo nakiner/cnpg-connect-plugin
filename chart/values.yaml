@@ -34,8 +34,8 @@ application:
     annotations: {}
     loadBalancerSourceRanges: []
   auth:
-    # Required before deployment. Generate a high-entropy token; do not commit it.
-    existingSecret: cnpg-connect-auth
+    # Optional legacy shared token. Read-only discovery is tokenless by default.
+    existingSecret: ""
     key: token
 
 # Secret names are relative to the release/operator namespace.
@@ -50,6 +50,8 @@ tls:
     # Set tls.crt to trust the operator-client leaf directly instead of a CA bundle.
     clientCAKey: ca.crt
   application:
+    # Set false behind an HTTP/2 gateway that terminates discovery TLS.
+    enabled: true
     existingSecret: ""
     # Include any external LB DNS name used by clients.
     extraDnsNames: []

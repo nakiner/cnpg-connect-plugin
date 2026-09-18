@@ -33,21 +33,30 @@ type Member struct {
 	ReplayLSN string              `json:"replayLSN,omitempty"`
 }
 
+// ConnectionParameters contains public PostgreSQL connection defaults, never
+// passwords or private keys. The database can be empty when bootstrap metadata
+// does not identify an application database.
+type ConnectionParameters struct {
+	Database    string `json:"database,omitempty"`
+	ServerCAPEM []byte `json:"serverCaPem,omitempty"`
+}
+
 // Snapshot is a complete replacement, never a delta. Revision is opaque and
 // changes on topology/routing changes, including invalidation; clients must not
 // compare revisions numerically. ObservedAt and ValidUntil change on successful
 // refreshes even when Revision does not. Clients MUST reject expired snapshots.
 type Snapshot struct {
-	APIVersion    string     `json:"apiVersion"`
-	Cluster       ClusterRef `json:"cluster"`
-	Revision      string     `json:"revision"`
-	ObservedAt    time.Time  `json:"observedAt"`
-	ValidUntil    time.Time  `json:"validUntil"`
-	Available     bool       `json:"available"`
-	Reason        string     `json:"reason,omitempty"`
-	PrimaryID     string     `json:"primaryId,omitempty"`
-	Transitioning bool       `json:"transitioning"`
-	Members       []Member   `json:"members"`
+	APIVersion    string               `json:"apiVersion"`
+	Cluster       ClusterRef           `json:"cluster"`
+	Revision      string               `json:"revision"`
+	ObservedAt    time.Time            `json:"observedAt"`
+	ValidUntil    time.Time            `json:"validUntil"`
+	Available     bool                 `json:"available"`
+	Reason        string               `json:"reason,omitempty"`
+	PrimaryID     string               `json:"primaryId,omitempty"`
+	Transitioning bool                 `json:"transitioning"`
+	Members       []Member             `json:"members"`
+	Connection    ConnectionParameters `json:"connection"`
 }
 
 type Error struct {

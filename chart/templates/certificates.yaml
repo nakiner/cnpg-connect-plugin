@@ -83,7 +83,7 @@ spec:
     {{- include "connect.issuerRef" . | nindent 4 }}
 ---
 {{- end }}
-{{- if not .Values.tls.application.existingSecret }}
+{{- if and .Values.tls.application.enabled (not .Values.tls.application.existingSecret) }}
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:

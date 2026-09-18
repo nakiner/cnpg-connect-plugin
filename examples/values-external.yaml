@@ -1,8 +1,7 @@
-# The LoadBalancer must support gRPC HTTP/2; this example uses TCP TLS passthrough.
-# Install into the operator namespace. Replace all example names and CIDRs.
+# Alternative to a TLS Gateway: TCP TLS passthrough to the plugin.
+# Supply a publicly trusted server certificate for topology.example.com
+# in this Secret; CNPG-I certificates still use the chart's private CA.
 fullnameOverride: cnpg-connect
-# The OCI chart selects the matching GHCR image; no image override is needed.
-# Narrow observer RBAC to the namespace containing the example Cluster.
 watchNamespace: databases
 application:
   service:
@@ -10,10 +9,9 @@ application:
     port: 443
     annotations: {}
     loadBalancerSourceRanges:
-      - 192.0.2.0/24
-  auth:
-    existingSecret: cnpg-connect-auth
+      - 192.0.2.0/24 # Replace with your applications' source CIDRs.
 tls:
   application:
-    extraDnsNames:
-      - topology.example.com
+    existingSecret: connect-public-discovery-tls
+# No discovery token is required. PostgreSQL endpoints are configured
+# separately on the Cluster when clients cannot reach its Pod network.

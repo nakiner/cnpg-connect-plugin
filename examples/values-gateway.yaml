@@ -1,0 +1,9 @@
+# Public TLS terminates at your existing Gateway; route gRPC to
+# cnpg-connect-api:443 in this namespace. Keep this h2c backend internal.
+fullnameOverride: cnpg-connect
+watchNamespace: databases
+tls:
+  application:
+    enabled: false
+# CNPG-I mTLS remains enabled and managed by cert-manager.
+# Discovery tokens are optional; no application.auth Secret is needed.

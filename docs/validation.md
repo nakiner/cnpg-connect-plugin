@@ -1,5 +1,10 @@
 # Validation record
 
+This record describes the earlier bearer-authenticated implementation. It does
+not claim live validation of the newer automatic Cluster observation, tokenless
+discovery, connection metadata, or Gateway setup. The isolated lifecycle tests support optional bearer
+authentication and can be rerun against the new release.
+
 Local validation on 2026-09-17 used an isolated `kind-cnpg-connect-test` cluster,
 with an explicit kubeconfig separate from the user's Kubernetes contexts:
 

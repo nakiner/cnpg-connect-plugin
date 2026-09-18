@@ -16,9 +16,8 @@ import (
 )
 
 // Server implements application discovery separately from the CNPG-I interface.
-// Runtime owns TLS and must require authentication except in explicit insecure
-// development mode. RPC methods enforce bearer authentication themselves so
-// registration cannot accidentally omit an authentication interceptor.
+// Runtime owns TLS. Read-only discovery needs no separate application token by
+// default; deployments can opt into the legacy shared bearer token.
 type Server struct {
 	connectv1.UnimplementedTopologyServiceServer
 	store         *Store
@@ -140,6 +139,7 @@ func toProto(snapshot v1.Snapshot) *connectv1.Snapshot {
 		PrimaryId:     snapshot.PrimaryID,
 		Transitioning: snapshot.Transitioning,
 		Members:       make([]*connectv1.Member, 0, len(snapshot.Members)),
+		Connection:    &connectv1.ConnectionParameters{Database: snapshot.Connection.Database, ServerCaPem: append([]byte(nil), snapshot.Connection.ServerCAPEM...)},
 	}
 	for _, member := range snapshot.Members {
 		converted := &connectv1.Member{

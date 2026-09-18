@@ -7,13 +7,9 @@ rpc GetTopology(GetTopologyRequest) returns (Snapshot);
 rpc WatchTopology(WatchTopologyRequest) returns (stream Snapshot);
 ```
 
-The application listener uses TLS with bearer authentication in gRPC metadata:
+The application endpoint uses verified TLS, either directly on the plugin or at a Gateway forwarding to its internal h2c listener. Discovery is read-only and tokenless by default. Applications send PostgreSQL credentials only to PostgreSQL. Deployments may optionally require `authorization: Bearer <token>` metadata by configuring a bearer Secret.
 
-```text
-authorization: Bearer <token>
-```
-
-Clusters must opt in through an enabled native plugin entry or the observation annotation. A native entry takes precedence over annotations, including explicit native disablement. Unknown or disabled Clusters return `NotFound`. Invalid resource names return `InvalidArgument`. Missing/invalid credentials return `Unauthenticated`. An observed Cluster with no safe routing view returns a snapshot marked unavailable; consumers must interpret the snapshot instead of treating a successful RPC as proof that a database is usable.
+Clusters in the configured watch scope are discovered automatically. An explicit `connect.cnpg.io/enabled: "false"` annotation disables observation. A disabled native plugin entry also excludes the Cluster; either explicit disablement wins. Native parameters take precedence over annotation parameters when a native entry exists. Unknown or disabled Clusters return `NotFound`. Invalid resource names return `InvalidArgument`. When optional bearer authentication is configured, missing/invalid bearer credentials return `Unauthenticated`. An observed Cluster with no safe routing view returns a snapshot marked unavailable; consumers must interpret the snapshot instead of treating a successful RPC as proof that a database is usable.
 
 ## Snapshot semantics
 
@@ -29,11 +25,17 @@ Each message fully replaces the previous snapshot for that Cluster. There is no 
 | `available` | Whether the observation produced a usable routing view |
 | `primary_id` | Pod UID of the eligible primary, if established |
 | `transitioning` | CNPG reports an ongoing primary transition |
+| `connection.database` | Default application database from CNPG bootstrap configuration; empty when none is declared |
+| `connection.server_ca_pem` | Public PostgreSQL server CA certificate bundle as PEM bytes (base64 in protobuf JSON) |
 | `members[].id` | Pod UID; changes after Pod replacement |
 | `members[].ready` | Member eligibility in this snapshot, beyond simple Pod readiness |
 | `members[].reason` | Diagnostic explanation; do not build policy on free-form text |
 | `members[].endpoints` | `internal` and optional `external` endpoint records |
 | `members[].timeline`, `replay_lsn` | Observed PostgreSQL information where available |
+
+The plugin reads the default database from the configured CNPG bootstrap method (`recovery.database`, `pg_basebackup.database`, or `initdb.database`). It does not infer a SQL database name from the Kubernetes Cluster name. Applications using another database can select it with the client library's advanced explicit connection configuration.
+
+The CA comes from `ca.crt` in the Secret referenced by `status.certificates.serverCASecret`. Only public certificate PEM blocks are published, never private keys or database credentials. A missing or unreadable usable CA makes the snapshot unavailable with `connection_defaults_unavailable`. Database/CA changes update the revision. An older plugin may omit `connection`; clients requiring automatic defaults should report that incompatibility or use their explicit advanced connection configuration.
 
 Role and replication state are independent protobuf enums:
 
@@ -55,30 +57,23 @@ Unknown state is distinct from asynchronous state. Replication settings alone do
 
 The reported `timeline` is [CNPG's checkpoint timeline](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.0/pkg/management/postgres/probes.go#L501), diagnostic metadata that can lag on a healthy streaming standby after promotion. Clients must not infer replica eligibility by comparing these timeline values.
 
-A client must reject expired data and unavailable snapshots, select only eligible members, and choose an endpoint from its configured network. Pool updates must account for role/identity changes even when the hostname is unchanged. An active SQL transaction can fail during a role change, and a failed commit can have an ambiguous outcome. Automatic write replay is outside this protocol.
+A client must reject expired data and unavailable snapshots, select only eligible members, and choose a reachable endpoint for the selected member. By default, cnpgconnect-go tries the internal address before the same member's advertised external address, retaining TLS verification and role checks; an explicit client network setting pins that network. Pool updates must account for role/identity changes even when the hostname is unchanged. An active SQL transaction can fail during a role change, and a failed commit can have an ambiguous outcome. Automatic write replay is outside this protocol.
 
 With `ANY 1 (a,b)`, both standbys may report `quorum` while one acknowledgment suffices. Even synchronous replication does not imply that every replica has replayed a given commit. Read-after-write requires primary routing or an appropriate replay-position check in the client.
 
 ## Inspect a deployed service
 
-Use an application discovery CA file distributed by your deployment. The following assumes the example release name `connect`, `fullnameOverride=cnpg-connect`, and a locally held `work/discovery-token` matching the Secret. It uses the checked-in proto instead of gRPC reflection.
-
-```sh
-kubectl -n cnpg-system port-forward service/cnpg-connect-api 8443:443
-```
-
-In another terminal:
+For an endpoint with a publicly trusted certificate, use the release-matched proto from a source checkout:
 
 ```sh
 grpcurl \
-  -cacert /path/to/discovery-ca.crt \
-  -authority cnpg-connect-api.cnpg-system.svc \
-  -H "authorization: Bearer $(cat work/discovery-token)" \
   -import-path proto -proto cnpg/connect/v1/topology.proto \
   -d '{"namespace":"databases","name":"app-db"}' \
-  127.0.0.1:8443 cnpg.connect.v1.TopologyService/GetTopology
+  topology.example.com:443 cnpg.connect.v1.TopologyService/GetTopology
 ```
 
-Replace the method with `WatchTopology` to receive the server stream. For an external LB, use its address instead of `127.0.0.1:8443` and use the matching certificate DNS name as `-authority`.
+Replace `GetTopology` with `WatchTopology` for the server stream. Reflection is not enabled. No discovery token or PostgreSQL login is needed unless optional bearer authentication is configured. Private discovery certificates and local port-forwarding are covered in [deployment options](deployment.md#private-in-cluster-endpoint).
 
-Clients can import `api/connect/v1` without importing the observer or Kubernetes packages. The companion `github.com/nakiner/cnpgconnect` library, available in a separate source checkout, implements discovery reconnection, role-selection policies, and managed connections for pgx, `database/sql`, and Bun. See its usage documentation for pool invalidation and in-flight operation behavior.
+Go clients import generated messages and the gRPC client from `github.com/nakiner/cnpg-connect-plugin/api/connect/v1`. This package does not import the observer or Kubernetes packages, although the plugin module declares Kubernetes dependencies. The companion [cnpgconnect-go](https://github.com/nakiner/cnpgconnect-go) library implements discovery reconnection, automatic connection defaults, role selection, and managed pgx/`database/sql`/Bun connections. Its root package is `cnpgconnectgo`.
+
+Connection metadata and tokenless defaults are new source changes; plugin `v0.0.3` predates them. Publish the updated plugin API/runtime before releasing a library version that relies on these defaults.
