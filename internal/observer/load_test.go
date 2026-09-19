@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,7 +24,6 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // TestFleetLoad is opt-in: go test -tags=loadtest -run TestFleetLoad -v ./internal/observer.
@@ -58,8 +56,7 @@ func runFleetLoad(t *testing.T, interval time.Duration) {
 	o.opts.TTL = 15 * time.Second
 	o.opts.ProbeTimeout = 2 * time.Second
 	o.configureProbeLimits()
-	template, _ := o.cluster(clusterKey{"test", "db"})
-	ca := testPublicCA(t)
+	ca := testConnection(t, o).ServerCAPEM
 	var promoted sync.Map
 	var probes atomic.Int64
 	o.probe = func(ctx context.Context, pod *corev1.Pod, _ v1.ConnectionParameters, _ string) (instanceStatus, error) {
@@ -84,48 +81,15 @@ func runFleetLoad(t *testing.T, interval time.Duration) {
 		if changed {
 			primarySuffix = "-2"
 		}
-		primary := strings.HasSuffix(pod.Name, primarySuffix)
-		result := instanceStatus{IsPrimary: &primary, SystemID: "fleet", Timeline: 1, WalReceiverActive: !primary}
-		if primary {
-			for _, suffix := range []string{"-1", "-2", "-3"} {
-				if suffix != primarySuffix {
-					result.Replication = append(result.Replication, replicationStatus{ApplicationName: name + suffix, State: "streaming", SyncState: "sync"})
-				}
-			}
-		}
-		return result, nil
+		return fleetStatus(pod, primarySuffix, "fleet"), nil
 	}
 
 	names := make([]string, databases)
 	for i := range databases {
 		name := fmt.Sprintf("fleet-%04d", i)
 		names[i] = name
-		cluster := template.DeepCopy()
-		cluster.SetName(name)
-		cluster.SetUID(types.UID(name))
-		_ = unstructured.SetNestedField(cluster.Object, name+"-1", "status", "currentPrimary")
-		_ = unstructured.SetNestedField(cluster.Object, name+"-1", "status", "targetPrimary")
-		_ = o.clusterInformer.GetIndexer().Add(cluster)
-		_, pods, results := fixture()
-		for j := range pods {
-			pods[j].Name = fmt.Sprintf("%s-%d", name, j+1)
-			pods[j].UID = types.UID(pods[j].Name)
-			pods[j].Labels["cnpg.io/cluster"] = name
-			pods[j].OwnerReferences[0].Name = name
-			pods[j].OwnerReferences[0].UID = types.UID(name)
-			_ = o.podInformer.GetIndexer().Add(&pods[j])
-		}
-		for j := range results[0].status.Replication {
-			results[0].status.Replication[j].ApplicationName = pods[j+1].Name
-		}
+		cluster, pods, results := addFleetCluster(t, o, name, "db-ca")
 		parameters := v1.ConnectionParameters{Database: "app", ServerCAPEM: ca}
-		o.connections.Store(clusterKey{"test", name}, cachedConnection{
-			parameters:   parameters,
-			uid:          name,
-			secret:       "db-ca",
-			certificates: `{"serverCASecret":"db-ca"}`,
-			refreshed:    time.Now(),
-		})
 		snapshot := buildSnapshot(cluster, pods, results, config.Parameters{}, time.Now(), o.opts.TTL)
 		snapshot.Connection = parameters
 		o.store.Put(snapshot)

@@ -14,24 +14,27 @@ import (
 
 func (o *Observer) observe(ctx context.Context, key clusterKey) bool {
 	started := time.Now()
+	defer o.observationDuration.UpdateDuration(started)
 	// Include queueing for probe slots and CA lookup in the collection deadline.
 	// A large or unreachable cluster must not monopolize a worker beyond its TTL.
 	timeout := o.opts.TTL - o.opts.PollInterval
 	if o.opts.ProbeTimeout <= timeout/2 {
 		timeout = 2 * o.opts.ProbeTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ioCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	o.stateMu.Lock()
 	c, exists := o.cluster(key)
 	if !exists {
 		o.store.Delete(key.namespace, key.name)
+		delete(o.primaries, key)
 		o.stateMu.Unlock()
 		return true
 	}
 	enabled, params, paramErr := parameters(c)
 	if !enabled || c.GetDeletionTimestamp() != nil {
 		o.store.Delete(key.namespace, key.name)
+		delete(o.primaries, key)
 		o.stateMu.Unlock()
 		return true
 	}
@@ -51,7 +54,7 @@ func (o *Observer) observe(ctx context.Context, key clusterKey) bool {
 			break
 		}
 	}
-	connection, err := o.cachedConnection(ctx, c)
+	connection, err := o.cachedConnection(ioCtx, c)
 	if err != nil {
 		return o.publishFailure(ctx, key, "connection_defaults_unavailable", started)
 	}
@@ -59,10 +62,10 @@ func (o *Observer) observe(ctx context.Context, key clusterKey) bool {
 	if serverName == "" {
 		serverName = fmt.Sprintf("%s-rw.%s.svc", c.GetName(), c.GetNamespace())
 	}
-	results := o.probeInstances(ctx, pods, connection, serverName, o.priority.IsUrgent(key))
-	if ctx.Err() != nil {
-		return false
-	}
+	results := o.probeInstances(ioCtx, pods, connection.ConnectionParameters, serverName, o.priority.IsUrgent(key))
+	// Exhausting the I/O budget is not supersession or shutdown. Completed
+	// results remain useful; incomplete probes already carry errors. Publish
+	// against the original context and recheck current metadata under the lock.
 	return o.publishObservation(ctx, key, c, pods, results, params, connection, started)
 }
 
@@ -116,6 +119,8 @@ func (o *Observer) probeInstances(ctx context.Context, pods []corev1.Pod, connec
 		}
 		probes.Go(func() {
 			defer release()
+			started := time.Now()
+			defer o.probeDuration.UpdateDuration(started)
 			probeCtx, cancel := context.WithTimeout(probeContext, o.opts.ProbeTimeout)
 			defer cancel()
 			results[i].status, results[i].err = o.probe(probeCtx, &pods[i], connection, serverName)
@@ -140,44 +145,56 @@ func (o *Observer) publishObservation(
 	probedPods []corev1.Pod,
 	results []statusResult,
 	params config.Parameters,
-	connection v1.ConnectionParameters,
+	connection connectionInfo,
 	started time.Time,
 ) bool {
 	o.stateMu.Lock()
 	defer o.stateMu.Unlock()
-	// Never renew a cached observation while either metadata watch is disconnected.
-	if ctx.Err() != nil || !o.Ready() {
-		return false
-	}
 	latest, exists := o.cluster(key)
 	if !exists {
 		o.store.Delete(key.namespace, key.name)
+		delete(o.primaries, key)
 		return true
 	}
 	enabled, _, _ := parameters(latest)
 	if !enabled || latest.GetDeletionTimestamp() != nil {
 		o.store.Delete(key.namespace, key.name)
+		delete(o.primaries, key)
 		return true
+	}
+	latestPods := o.pods(latest)
+	conflict := false
+	if observed.GetUID() == latest.GetUID() {
+		conflict = o.conflictingPrimary(observed, latest, probedPods, latestPods, results)
+	}
+	// Preserve obtained safety evidence even when a metadata event superseded
+	// collection, but never renew routes after cancellation or watch failure.
+	if ctx.Err() != nil || !o.Ready() {
+		return false
 	}
 	if !sameClusterRoute(observed, latest) {
 		o.Notify(key.namespace, key.name)
 		o.publish(unavailable(latest, time.Now().UTC(), o.opts.TTL, "topology_changed_during_observation"), started)
 		return false
 	}
-	latestPods := o.pods(latest)
-	mapped := matchInstanceResults(probedPods, latestPods, results)
-	current, _ := primaryNames(latest)
-	for i, pod := range latestPods {
-		if pod.Name == current && isCertificateError(mapped[i].err) {
-			// A CA rotation may cause a TLS failure before CNPG publishes certificate
-			// metadata. Refetch the named public CA on the next attempt.
-			o.connections.Delete(key)
-		}
+	if !o.currentCA(connection.ca) {
+		o.Notify(key.namespace, key.name)
+		o.publish(unavailable(latest, time.Now().UTC(), o.opts.TTL, "connection_defaults_changed"), started)
+		return false
 	}
+	mapped := matchInstanceResults(probedPods, latestPods, results)
 	// A changed replica is excluded until verified. It does not invalidate the
 	// independently verified primary or unrelated replicas.
 	snapshot := buildSnapshot(latest, latestPods, mapped, params, started.UTC(), o.opts.TTL)
-	snapshot.Connection = connection
+	if conflict {
+		snapshot.Available = false
+		snapshot.PrimaryID = ""
+		snapshot.Reason = "multiple_primaries_observed"
+		for i := range snapshot.Members {
+			snapshot.Members[i].Ready = false
+		}
+	}
+	snapshot.Connection = connection.ConnectionParameters
 	o.publish(snapshot, started)
 	return snapshot.Available
 }

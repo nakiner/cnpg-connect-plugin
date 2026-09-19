@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
@@ -28,6 +29,8 @@ type record struct {
 // A subscriber has room for one snapshot. Slow consumers receive the latest
 // complete state; no caller may depend on observing every intermediate revision.
 type Store struct {
+	coalesced        atomic.Uint64
+	expirations      uint64 // protected by mu
 	mu               sync.Mutex
 	records          map[clusterKey]*record
 	subscribers      map[clusterKey]map[*subscription]struct{}
@@ -255,6 +258,7 @@ func (s *Store) subscribeShared(namespace, name string) (<-chan *publication, fu
 }
 
 func (s *Store) register(namespace, name string, requireExisting bool, watcher *subscription) (func(), bool) {
+	watcher.coalesced = &s.coalesced
 	key := clusterKey{namespace, name}
 	s.mu.Lock()
 	current, exists := s.records[key]
@@ -268,8 +272,8 @@ func (s *Store) register(namespace, name string, requireExisting bool, watcher *
 		expired = s.expireRecord(key, current, time.Now())
 		initial = current.publication
 	}
-	first := len(s.subscribers[key]) == 0
-	if first {
+	active := s.hasDemand(key, time.Now())
+	if len(s.subscribers[key]) == 0 {
 		s.subscribers[key] = make(map[*subscription]struct{})
 	}
 	s.subscribers[key][watcher] = struct{}{}
@@ -279,7 +283,7 @@ func (s *Store) register(namespace, name string, requireExisting bool, watcher *
 	if initial != nil {
 		watcher.deliver(initial)
 	}
-	if first && handler != nil {
+	if !active && handler != nil {
 		handler(namespace, name)
 	}
 
@@ -341,6 +345,7 @@ func (s *Store) expireRecord(key clusterKey, current *record, now time.Time) not
 	current.publication = s.newPublication(expired)
 	current.routing = routingDigest(expired)
 	current.expired = true
+	s.expirations++
 	return s.notification(key, current.publication)
 }
 

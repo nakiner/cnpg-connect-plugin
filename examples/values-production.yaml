@@ -1,0 +1,52 @@
+# Example for release name `connect` in cnpg-system. Requires at least two nodes.
+# Pin image.digest to the published manifest digest, or install a release chart
+# whose defaults already pin it. Do not enable public discovery without limits
+# at the ingress/LB as well as the in-process admission controls.
+replicaCount: 2
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+topologySpreadConstraints:
+  - maxSkew: 1
+    minDomains: 2
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    # Balance the replacement replicas themselves during a rolling update.
+    matchLabelKeys: [pod-template-hash]
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/instance: connect
+        app.kubernetes.io/name: cnpg-connect-plugin
+networkPolicy:
+  enabled: true
+  # Explicitly label client namespaces; do not replace with an empty peer.
+  discoveryFrom:
+    - namespaceSelector:
+        matchLabels:
+          cnpg-connect-client: "true"
+  monitoringFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  # Set actual control-plane ports/CIDRs; check your CNI's DNAT enforcement.
+  apiServerPorts: [443, 6443]
+  # Empty permits configured control-plane ports to all IPs.
+  apiServerCIDRs: []
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8081"
+  prometheus.io/path: /metrics
+application:
+  limits:
+    maxConcurrentStreams: 128
+    maxConnections: 1024
+    maxRPCs: 4096
+    maxWatches: 2048
+    initialRequestTimeout: 5s
+resources:
+  requests:
+    cpu: "1"
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi

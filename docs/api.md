@@ -13,9 +13,22 @@ Clusters in the configured watch scope are discovered automatically. An explicit
 
 ## Snapshot semantics
 
-Each message fully replaces the previous snapshot for that Cluster. There is no event replay cursor, delta format, or guarantee that every intermediate transition is delivered. Pending updates may be coalesced for slow clients.
+Each message is a complete snapshot for that Cluster, not a delta. It replaces
+the previous routing view subject to freshness and withdrawal ordering; it must
+not resurrect a known-withdrawn member through replay. There is no event replay
+cursor or guarantee that every intermediate transition is delivered. Pending
+updates may be coalesced for slow clients.
 
-`WatchTopology` starts with the current snapshot. Successful observation refreshes continue even without a topology change: the opaque `revision` can remain the same while `observed_at` and `valid_until` advance. After a stream ends, reconnect with backoff and accept the new initial snapshot. The server also periodically renews connections (five-minute maximum age with a 30-second grace period), so reconnection is normal operation. A deleted or disabled Cluster sends an unavailable tombstone to existing watchers; the subscription can subsequently observe recreation under the same name.
+An unavailable/transitioning snapshot for the same Cluster UID revokes routes
+even when another observer replica carries an older observation timestamp.
+Keep the positive observation high-water mark: a whole-snapshot withdrawal needs
+a strictly newer positive observation to recover. An equal-time snapshot can
+withdraw individual members without making the healthy primary unavailable;
+replaying the pre-withdrawal snapshot must not restore those members. A newer
+observation can restore eligibility. Clock synchronization between observer
+replicas remains required; this protocol is not a consensus or fencing system.
+
+`WatchTopology` starts with the current snapshot. Successful observation refreshes continue even without a topology change: the opaque `revision` can remain the same while `observed_at` and `valid_until` advance. After a stream ends, reconnect with backoff and accept the new initial snapshot. The server also periodically renews connections (discovery connections close after at most five minutes and 30 seconds), so reconnection is normal operation. A deleted or disabled Cluster sends an unavailable tombstone to existing watchers; the subscription can subsequently observe recreation under the same name.
 
 | Field | Meaning |
 | --- | --- |
@@ -35,7 +48,7 @@ Each message fully replaces the previous snapshot for that Cluster. There is no 
 
 The plugin reads the default database from the configured CNPG bootstrap method (`recovery.database`, `pg_basebackup.database`, or `initdb.database`). It does not infer a SQL database name from the Kubernetes Cluster name. Applications using another database can select it with the client library's advanced explicit connection configuration.
 
-The CA comes from `ca.crt` in the Secret referenced by `status.certificates.serverCASecret`. Only public certificate PEM blocks are published, never private keys or database credentials. A missing or unreadable usable CA makes the snapshot unavailable with `connection_defaults_unavailable`. Database/CA changes update the revision. An older plugin may omit `connection`; clients requiring automatic defaults should report that incompatibility or use their explicit advanced connection configuration.
+The CA comes from `ca.crt` in the Secret referenced by `status.certificates.serverCASecret`. Only public certificate PEM blocks are published, never private keys or database credentials. Secret metadata watches trigger CA refreshes, including when Cluster status is unchanged; there is no periodic CA polling. A missing or unreadable usable CA makes the snapshot unavailable with `connection_defaults_unavailable`. Database/CA changes update the revision. An older plugin may omit `connection`; clients requiring automatic defaults should report that incompatibility or use their explicit advanced connection configuration.
 
 Role and replication state are independent protobuf enums:
 

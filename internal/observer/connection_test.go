@@ -8,14 +8,11 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
-	"net/http"
-	"net/http/httptest"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,9 +20,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	metadatafake "k8s.io/client-go/metadata/fake"
+	ktesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/util/workqueue"
 )
 
 func testPublicCA(t *testing.T) []byte {
@@ -40,6 +39,26 @@ func testPublicCA(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func installTestCA(t *testing.T, o *Observer, secret *corev1.Secret) {
+	t.Helper()
+	meta := &metav1.PartialObjectMetadata{ObjectMeta: secret.ObjectMeta}
+	if err := o.secretInformer.GetIndexer().Add(meta); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: secret.Namespace, Name: secret.Name}
+	o.cas[key] = &cachedCA{key: key, uid: secret.UID, resourceVersion: secret.ResourceVersion, public: secret.Data["ca.crt"]}
+}
+
+func testConnection(t *testing.T, o *Observer) connectionInfo {
+	t.Helper()
+	cluster, _ := o.cluster(clusterKey{"test", "db"})
+	info, err := o.cachedConnection(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
 }
 
 func TestApplicationDatabaseUsesBootstrapMetadata(t *testing.T) {
@@ -58,353 +77,222 @@ func TestApplicationDatabaseUsesBootstrapMetadata(t *testing.T) {
 }
 
 func TestConnectionParametersReadOnlyNamedPublicCA(t *testing.T) {
-	o, kube, dyn := fakeObserver(t)
-	ctx := context.Background()
-	cluster, err := dyn.Resource(clusterResource).Namespace("test").Get(ctx, "db", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	o, kube, _ := fakeObserver(t)
 	public := testPublicCA(t)
 	private := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("must never be published")})
-	_, err = kube.CoreV1().Secrets("test").Update(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test"}, Data: map[string][]byte{
+	_, err := kube.CoreV1().Secrets("test").Update(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test", UID: "ca-uid", ResourceVersion: "2"}, Data: map[string][]byte{
 		"ca.crt": append(append([]byte(nil), public...), private...), "ca.key": private, "password": []byte("database-password"),
 	}}, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	kube.ClearActions()
-	got, err := o.connectionParameters(ctx, cluster)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Database != "app" || !bytes.Equal(got.ServerCAPEM, public) {
-		t.Fatal("lost public connection defaults or published unrelated Secret data")
+	got, err := o.readPublicCA(context.Background(), "test", "db-ca")
+	if err != nil || !bytes.Equal(got.public, public) {
+		t.Fatal("lost public CA or published unrelated Secret data", err)
 	}
 	actions := kube.Actions()
 	if len(actions) != 1 || actions[0].GetVerb() != "get" || actions[0].GetResource().Resource != "secrets" || actions[0].GetNamespace() != "test" {
 		t.Fatalf("unexpected API requests: %+v", actions)
 	}
-	cluster.SetNamespace("other")
-	if _, err := o.connectionParameters(ctx, cluster); err == nil {
-		t.Fatal("CA escaped the requested cluster namespace")
+	if _, err := o.readPublicCA(context.Background(), "other", "db-ca"); err == nil {
+		t.Fatal("CA escaped the requested namespace")
 	}
 }
 
-func TestConnectionCARotationAndLoss(t *testing.T) {
+func TestSecretWatchRotationDeletionAndRecreation(t *testing.T) {
 	o, kube, _ := fakeObserver(t)
-	ctx := context.Background()
-	observe(t, o)
-	before, _ := o.store.Get("test", "db")
-	public := testPublicCA(t)
-	if _, err := kube.CoreV1().Secrets("test").Update(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test"}, Data: map[string][]byte{"ca.crt": public}}, metav1.UpdateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	o.connections.Delete(clusterKey{"test", "db"})
-	observe(t, o)
-	after, _ := o.store.Get("test", "db")
-	if !after.Available || after.Revision == before.Revision || !bytes.Equal(after.Connection.ServerCAPEM, public) {
-		t.Fatal("CA rotation did not refresh connection defaults and revision")
-	}
-	if err := kube.CoreV1().Secrets("test").Delete(ctx, "db-ca", metav1.DeleteOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	o.connections.Delete(clusterKey{"test", "db"})
-	observe(t, o)
-	failed, _ := o.store.Get("test", "db")
-	if failed.Available || failed.Reason != "connection_defaults_unavailable" {
-		t.Fatal("missing CA silently published unverified connection defaults")
-	}
-}
-
-func TestNetworkFailureDoesNotRefetchCAAndTLSFailureDoes(t *testing.T) {
-	o, kube, _ := fakeObserver(t)
-	observe(t, o)
-	kube.ClearActions()
-	original := o.probe
-	failure := error(errors.New("connection refused"))
-	o.probe = func(ctx context.Context, p *corev1.Pod, c v1.ConnectionParameters, s string) (instanceStatus, error) {
-		if p.Name == "db-1" {
-			return instanceStatus{}, failure
-		}
-		return original(ctx, p, c, s)
-	}
-	for range 3 {
-		observe(t, o)
-	}
-	if len(kube.Actions()) != 0 {
-		t.Fatal("network outage caused CA reads")
-	}
-	failure = fmt.Errorf("request failed: %w", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}})
-	observe(t, o)
-	o.probe = original
-	observe(t, o)
-	if len(kube.Actions()) != 1 {
-		t.Fatalf("CA verification recovery requests=%d", len(kube.Actions()))
-	}
-}
-
-func TestCARefreshesAreSpreadAcrossClusters(t *testing.T) {
-	c, _, _ := fixture()
-	seen := make(map[time.Duration]bool)
-	for i := range 2000 {
-		c.SetName(fmt.Sprint(i))
-		lifetime := connectionCacheLifetime(c)
-		if lifetime < 3*time.Minute || lifetime >= 5*time.Minute {
-			t.Fatalf("unexpected lifetime %s", lifetime)
-		}
-		seen[lifetime] = true
-	}
-	if len(seen) < 1900 {
-		t.Fatal("CA refreshes converge on the same deadline")
-	}
-}
-
-func TestConnectionReadCancellationIsPerWaiter(t *testing.T) {
-	var group connectionReadGroup
-	key := connectionReadKey{namespace: "test", secret: "shared-ca"}
-	started := make(chan context.Context, 1)
-	finish := make(chan struct{})
-	var calls atomic.Int64
-	fetch := func(ctx context.Context) ([]byte, error) {
-		calls.Add(1)
-		started <- ctx
-		select {
-		case <-finish:
-			return []byte("public"), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	firstCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	first := make(chan error, 1)
-	go func() { _, err := group.read(firstCtx, key, time.Second, fetch); first <- err }()
-	requestCtx := <-started
-	second := make(chan error, 1)
-	go func() { _, err := group.read(context.Background(), key, time.Second, fetch); second <- err }()
-	waitFor(t, func() bool {
-		group.mu.Lock()
-		defer group.mu.Unlock()
-		return group.pending[key] != nil && group.pending[key].waiters == 2
-	})
-	cancel()
-	if err := <-first; !errors.Is(err, context.Canceled) {
-		t.Fatalf("first waiter error=%v", err)
-	}
-	if requestCtx.Err() != nil {
-		t.Fatal("one canceled waiter canceled a shared CA request")
-	}
-	close(finish)
-	if err := <-second; err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("overlapping reads=%d", calls.Load())
-	}
-}
-
-func TestCanceledConnectionReadCannotRemoveItsReplacement(t *testing.T) {
-	var group connectionReadGroup
-	key := connectionReadKey{namespace: "test", secret: "shared-ca"}
-	firstCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	started := make(chan context.Context, 1)
-	oldFinished := make(chan struct{})
-	allowOldCompletion := make(chan struct{})
-	defer close(allowOldCompletion)
-	first := make(chan error, 1)
-	go func() {
-		_, err := group.read(firstCtx, key, time.Second, func(ctx context.Context) ([]byte, error) {
-			started <- ctx
-			<-ctx.Done()
-			<-allowOldCompletion
-			close(oldFinished)
-			return nil, ctx.Err()
-		})
-		first <- err
-	}()
-	requestCtx := <-started
-	group.mu.Lock()
-	oldCall := group.pending[key]
-	group.mu.Unlock()
-	cancel()
-	if err := <-first; !errors.Is(err, context.Canceled) {
-		t.Fatalf("first waiter error=%v", err)
-	}
-	if requestCtx.Err() == nil {
-		t.Fatal("last waiter did not cancel the request")
-	}
-	newStarted := make(chan struct{})
-	allowNewCompletion := make(chan struct{})
-	second := make(chan error, 1)
-	go func() {
-		_, err := group.read(context.Background(), key, time.Second, func(context.Context) ([]byte, error) {
-			close(newStarted)
-			<-allowNewCompletion
-			return []byte("new CA"), nil
-		})
-		second <- err
-	}()
-	<-newStarted
-	group.mu.Lock()
-	replacement := group.pending[key]
-	group.mu.Unlock()
-	// Let the old transport finish late, after a new request owns the key.
-	allowOldCompletion <- struct{}{}
-	<-oldFinished
-	<-oldCall.done
-	group.mu.Lock()
-	preserved := group.pending[key] == replacement
-	group.mu.Unlock()
-	if !preserved {
-		t.Fatal("an old request removed its replacement")
-	}
-	close(allowNewCompletion)
-	if err := <-second; err != nil {
-		t.Fatalf("replacement read failed: %v", err)
-	}
-}
-
-func TestConnectionReadsKeepNamespacesAndCertificateViewsSeparate(t *testing.T) {
-	var group connectionReadGroup
-	keys := []connectionReadKey{
-		{namespace: "a", secret: "ca", certificates: "old"},
-		{namespace: "b", secret: "ca", certificates: "old"},
-		{namespace: "a", secret: "other-ca", certificates: "old"},
-		{namespace: "a", secret: "ca", certificates: "rotated"},
-	}
-	started := make(chan struct{}, len(keys))
-	finish := make(chan struct{})
-	done := make(chan error, len(keys))
-	for _, key := range keys {
-		go func() {
-			_, err := group.read(context.Background(), key, time.Second, func(context.Context) ([]byte, error) {
-				started <- struct{}{}
-				<-finish
-				return nil, nil
-			})
-			done <- err
-		}()
-	}
-	for range keys {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			t.Fatal("unrelated CA reads were coalesced")
-		}
-	}
-	close(finish)
-	for range keys {
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func TestCachedConnectionInvalidationNeverExtendsCAFreshness(t *testing.T) {
-	o, kube, _ := fakeObserver(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- o.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	waitFor(t, o.Ready)
+	_, unsubscribe := o.store.Subscribe("test", "db")
+	defer unsubscribe()
+	waitFor(t, func() bool { s, _ := o.store.Get("test", "db"); return s.Available })
 	cluster, _ := o.cluster(clusterKey{"test", "db"})
-	key := clusterKey{"test", "db"}
-	ctx := context.Background()
-	first, err := o.cachedConnection(ctx, cluster)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kube.ClearActions()
-	if _, err := o.cachedConnection(ctx, cluster); err != nil || len(kube.Actions()) != 0 {
-		t.Fatal("valid per-Cluster CA cache was not reused")
-	}
-	for _, change := range []string{"metadata", "uid", "expiry"} {
+	metaClient := o.metadata.(*metadatafake.FakeMetadataClient)
+	for _, change := range []string{"rotate", "delete", "recreate"} {
 		t.Run(change, func(t *testing.T) {
-			public := testPublicCA(t)
-			_, err := kube.CoreV1().Secrets("test").Update(ctx, &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test"},
-				Data:       map[string][]byte{"ca.crt": public},
-			}, metav1.UpdateOptions{})
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test", UID: "ca-uid", ResourceVersion: "2"}, Data: map[string][]byte{"ca.crt": testPublicCA(t)}}
+			switch change {
+			case "rotate":
+				if _, err := kube.CoreV1().Secrets("test").Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			case "delete":
+				if err := kube.CoreV1().Secrets("test").Delete(ctx, "db-ca", metav1.DeleteOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := metaClient.Tracker().Delete(secretResource, "test", "db-ca"); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, func() bool {
+					s, _ := o.store.Get("test", "db")
+					return !s.Available && len(s.Connection.ServerCAPEM) == 0
+				})
+				return
+			case "recreate":
+				secret.UID, secret.ResourceVersion = "replacement-ca", "3"
+				if _, err := kube.CoreV1().Secrets("test").Create(ctx, secret, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			meta := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: secret.ObjectMeta}
+			var err error
+			if change == "recreate" {
+				err = metaClient.Tracker().Create(secretResource, meta, "test")
+			} else {
+				err = metaClient.Tracker().Update(secretResource, meta, "test")
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			switch change {
-			case "metadata":
-				_ = unstructured.SetNestedField(cluster.Object, "rotated", "status", "certificates", "expirations", "db-ca")
-			case "uid":
-				cluster.SetUID(types.UID("replacement"))
-			case "expiry":
-				entry, _ := o.connections.Load(key)
-				cached := entry.(cachedConnection)
-				cached.refreshed = time.Now().Add(-5 * time.Minute)
-				o.connections.Store(key, cached)
-			}
-			kube.ClearActions()
-			got, err := o.cachedConnection(ctx, cluster)
-			if err != nil || !bytes.Equal(got.ServerCAPEM, public) || len(kube.Actions()) != 1 {
-				t.Fatalf("CA was not refreshed: error=%v API reads=%d", err, len(kube.Actions()))
-			}
-			if bytes.Equal(first.ServerCAPEM, got.ServerCAPEM) {
-				t.Fatal("old CA remained after invalidation")
+			waitFor(t, func() bool {
+				s, _ := o.store.Get("test", "db")
+				return s.Available && bytes.Equal(s.Connection.ServerCAPEM, secret.Data["ca.crt"])
+			})
+			current, _ := o.cluster(clusterKey{"test", "db"})
+			if !sameClusterRoute(cluster, current) {
+				t.Fatal("test unexpectedly changed Cluster metadata")
 			}
 		})
-	}
-	if err := kube.CoreV1().Secrets("test").Delete(ctx, "db-ca", metav1.DeleteOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	entry, _ := o.connections.Load(key)
-	cached := entry.(cachedConnection)
-	cached.refreshed = time.Now().Add(-5 * time.Minute)
-	o.connections.Store(key, cached)
-	if got, err := o.cachedConnection(ctx, cluster); err == nil || len(got.ServerCAPEM) != 0 {
-		t.Fatal("failed refresh served an expired CA")
 	}
 }
 
-func TestChangedCertificateMetadataDoesNotJoinAnOlderRead(t *testing.T) {
-	o, _, _ := fakeObserver(t)
-	cluster, _ := o.cluster(clusterKey{"test", "db"})
-	oldCA, newCA := testPublicCA(t), testPublicCA(t)
-	firstStarted := make(chan struct{})
-	finishFirst := make(chan struct{})
-	var calls atomic.Int64
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		public := newCA
-		if calls.Add(1) == 1 {
-			public = oldCA
-			close(firstStarted)
-			select {
-			case <-finishFirst:
-			case <-r.Context().Done():
-				return
+func TestCAFetchesAreSharedAndOnlyDemanded(t *testing.T) {
+	o, kube, _ := fakeObserver(t)
+	key := types.NamespacedName{Namespace: "test", Name: "db-ca"}
+	delete(o.cas, key)
+	kube.ClearActions()
+	if !o.fetchCA(context.Background(), key) || len(kube.Actions()) != 0 {
+		t.Fatal("idle CA was fetched")
+	}
+	var workers sync.WaitGroup
+	for i := range 100 {
+		name := fmt.Sprintf("shared-%d", i)
+		c, _, _ := addFleetCluster(t, o, name, "db-ca")
+		o.clusterEvent(nil, c)
+		_, cancel := o.store.Subscribe("test", name)
+		defer cancel()
+		workers.Go(func() { _, _ = o.cachedConnection(context.Background(), c) })
+	}
+	workers.Wait()
+	if o.caQueue.Len() != 1 {
+		t.Fatalf("queued CA reads=%d, want one", o.caQueue.Len())
+	}
+	o.workCA(context.Background())
+	if len(kube.Actions()) != 1 {
+		t.Fatalf("shared CA requests=%d", len(kube.Actions()))
+	}
+	for range 10 {
+		testConnection(t, o)
+	}
+	if len(kube.Actions()) != 1 {
+		t.Fatal("unchanged CA was fetched again")
+	}
+}
+
+func TestLateCAReadCannotRestoreDeletedOrReplacedSecret(t *testing.T) {
+	for _, change := range []string{"delete", "replace"} {
+		t.Run(change, func(t *testing.T) {
+			o, kube, _ := fakeObserver(t)
+			key := types.NamespacedName{Namespace: "test", Name: "db-ca"}
+			delete(o.cas, key)
+			_, unsubscribe := o.store.Subscribe("test", "db")
+			defer unsubscribe()
+			started, release := make(chan struct{}), make(chan struct{})
+			old, _ := kube.CoreV1().Secrets("test").Get(context.Background(), "db-ca", metav1.GetOptions{})
+			kube.PrependReactor("get", "secrets", func(ktesting.Action) (bool, runtime.Object, error) { close(started); <-release; return true, old, nil })
+			done := make(chan bool, 1)
+			go func() { done <- o.fetchCA(context.Background(), key) }()
+			<-started
+			meta := o.secretMetadata(key).DeepCopy()
+			if change == "delete" {
+				_ = o.secretInformer.GetIndexer().Delete(meta)
+			} else {
+				meta.UID, meta.ResourceVersion = "replacement", "2"
+				_ = o.secretInformer.GetIndexer().Update(meta)
 			}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(corev1.Secret{
-			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-			Data:     map[string][]byte{"ca.crt": public},
+			o.secretEvent(meta)
+			close(release)
+			if <-done {
+				t.Fatal("stale CA read was accepted")
+			}
+			if o.cas[key] != nil {
+				t.Fatal("stale CA restored the cache")
+			}
 		})
-	}))
-	defer api.Close()
-	defer close(finishFirst)
-	var err error
-	o.kube, err = kubernetes.NewForConfig(&rest.Config{Host: api.URL, QPS: 100, Burst: 200})
-	if err != nil {
-		t.Fatal(err)
 	}
-	first := make(chan error, 1)
-	go func() {
-		_, err := o.connectionParameters(context.Background(), cluster)
-		first <- err
-	}()
-	<-firstStarted
-	changed := cluster.DeepCopy()
-	_ = unstructured.SetNestedField(changed.Object, "new", "status", "certificates", "expirations", "db-ca")
-	got, err := o.connectionParameters(context.Background(), changed)
-	if err != nil || !bytes.Equal(got.ServerCAPEM, newCA) {
-		t.Fatalf("changed metadata joined old read: %v", err)
+}
+
+func TestSecretChangeDuringProbeCannotPublishOldCA(t *testing.T) {
+	o, _, _ := fakeObserver(t)
+	probe := o.probe
+	o.probe = func(ctx context.Context, pod *corev1.Pod, c v1.ConnectionParameters, s string) (instanceStatus, error) {
+		if pod.Name == "db-1" {
+			meta := o.secretMetadata(types.NamespacedName{Namespace: "test", Name: "db-ca"}).DeepCopy()
+			meta.ResourceVersion = "2"
+			_ = o.secretInformer.GetIndexer().Update(meta) // Event delivery can lag this update.
+		}
+		return probe(ctx, pod, c, s)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("reads=%d, want distinct CA requests for changed metadata", calls.Load())
+	observe(t, o)
+	s, _ := o.store.Get("test", "db")
+	if s.Available || len(s.Connection.ServerCAPEM) != 0 {
+		t.Fatal("old CA published after Secret changed")
 	}
-	finishFirst <- struct{}{}
-	if err := <-first; err != nil {
-		t.Fatal(err)
+}
+
+func TestSecretChangeInvalidatesIdleSnapshotWithoutFetching(t *testing.T) {
+	o, kube, _ := fakeObserver(t)
+	observe(t, o)
+	key := types.NamespacedName{Namespace: "test", Name: "db-ca"}
+	meta := o.secretMetadata(key).DeepCopy()
+	meta.ResourceVersion = "2"
+	_ = o.secretInformer.GetIndexer().Update(meta)
+	o.secretEvent(meta)
+	stream, cancel := o.store.Subscribe("test", "db")
+	defer cancel()
+	if snapshot := <-stream; snapshot.Available || len(snapshot.Connection.ServerCAPEM) != 0 {
+		t.Fatal("new subscriber received invalidated CA from an idle snapshot")
+	}
+	if len(kube.Actions()) != 0 {
+		t.Fatal("idle Secret event fetched CA contents")
+	}
+}
+
+func TestRepeatedCAMissesRespectSecretRetryDelay(t *testing.T) {
+	o, kube, _ := fakeObserver(t)
+	key := types.NamespacedName{Namespace: "test", Name: "db-ca"}
+	delete(o.cas, key)
+	o.caQueue.ShutDown()
+	o.caQueue = workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedItemExponentialFailureRateLimiter[types.NamespacedName](time.Hour, time.Hour))
+	_, cancel := o.store.Subscribe("test", "db")
+	defer cancel()
+	kube.PrependReactor("get", "secrets", func(ktesting.Action) (bool, runtime.Object, error) { return true, nil, errors.New("forbidden") })
+	cluster, _ := o.cluster(clusterKey{"test", "db"})
+	_, _ = o.cachedConnection(context.Background(), cluster)
+	o.workCA(context.Background())
+	for range 100 {
+		_, _ = o.cachedConnection(context.Background(), cluster)
+	}
+	if o.caQueue.Len() != 0 || o.caQueue.NumRequeues(key) != 1 {
+		t.Fatal("cache misses bypassed the Secret retry delay")
+	}
+}
+
+func TestConnectionFailuresDoNotPollUnchangedCA(t *testing.T) {
+	for _, failure := range []error{errors.New("connection refused"), &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}} {
+		o, kube, _ := fakeObserver(t)
+		o.probe = func(context.Context, *corev1.Pod, v1.ConnectionParameters, string) (instanceStatus, error) {
+			return instanceStatus{}, failure
+		}
+		for range 3 {
+			observe(t, o)
+		}
+		if len(kube.Actions()) != 0 {
+			t.Fatal("failed probe caused CA polling")
+		}
 	}
 }

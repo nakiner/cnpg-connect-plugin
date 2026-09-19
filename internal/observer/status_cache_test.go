@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -127,10 +128,11 @@ func TestStatusClientRotationReplacesTrustWithoutWeakeningVerification(t *testin
 	if _, err := readStatusHTTP(context.Background(), rotated, rotatedServer.URL+"/pg/status"); err != nil {
 		t.Fatalf("replacement client rejected the rotated CA: %v", err)
 	}
-	if _, err := readStatusHTTP(context.Background(), rotated, previousServer.URL+"/pg/status"); !isCertificateError(err) {
+	var verification *tls.CertificateVerificationError
+	if _, err := readStatusHTTP(context.Background(), rotated, previousServer.URL+"/pg/status"); !errors.As(err, &verification) {
 		t.Fatalf("replacement client retained retired trust: %v", err)
 	}
-	if _, err := readStatusHTTP(context.Background(), previous, rotatedServer.URL+"/pg/status"); !isCertificateError(err) {
+	if _, err := readStatusHTTP(context.Background(), previous, rotatedServer.URL+"/pg/status"); !errors.As(err, &verification) {
 		t.Fatalf("rotation mutated an existing client's trust: %v", err)
 	}
 	current, err := o.statusClient(rotatedCA, statusCacheServerName)

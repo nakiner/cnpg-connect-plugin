@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"sync"
+	"sync/atomic"
 
 	connectv1 "github.com/nakiner/cnpg-connect-plugin/api/connect/v1"
 	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
@@ -36,6 +37,7 @@ func (n notification) deliver() {
 // owned copies; the gRPC path shares immutable publications. Its mutex protects
 // mailbox replacement and close, and never covers a network write.
 type subscription struct {
+	coalesced    *atomic.Uint64
 	mu           sync.Mutex
 	order        uint64
 	closed       bool
@@ -50,10 +52,14 @@ func (s *subscription) deliver(published *publication) {
 		return
 	}
 	s.order = published.order
+	var replaced bool
 	if s.publications != nil {
-		replacePending(s.publications, published)
+		replaced = replacePending(s.publications, published)
 	} else {
-		replacePending(s.snapshots, clone(published.snapshot))
+		replaced = replacePending(s.snapshots, clone(published.snapshot))
+	}
+	if replaced && s.coalesced != nil {
+		s.coalesced.Add(1)
 	}
 }
 
@@ -70,10 +76,13 @@ func (s *subscription) close() {
 
 // Only the subscription owns sends and close. A concurrent receiver can drain
 // the slot, but cannot fill it, so sending after this drain never blocks.
-func replacePending[T any](updates chan T, latest T) {
+func replacePending[T any](updates chan T, latest T) bool {
+	replaced := false
 	select {
 	case <-updates:
+		replaced = true
 	default:
 	}
 	updates <- latest
+	return replaced
 }

@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -82,13 +81,10 @@ type statusClientEntry struct {
 func (o *Observer) statusClient(connection v1.ConnectionParameters, serverName string) (*http.Client, error) {
 	digest := sha256.Sum256(connection.ServerCAPEM)
 	o.statusClientMu.RLock()
-	if value, ok := o.statusClients.Load(serverName); ok {
-		entry := value.(*statusClientEntry)
-		if entry.digest == digest {
-			entry.lastUsed.Store(time.Now().UnixNano())
-			o.statusClientMu.RUnlock()
-			return entry.client, nil
-		}
+	if entry := o.statusClients[serverName]; entry != nil && entry.digest == digest {
+		entry.lastUsed.Store(time.Now().UnixNano())
+		o.statusClientMu.RUnlock()
+		return entry.client, nil
 	}
 	o.statusClientMu.RUnlock()
 	// Parsing a new CA must not block cached clients for unrelated Clusters.
@@ -126,8 +122,7 @@ func (o *Observer) statusClient(connection v1.ConnectionParameters, serverName s
 	}
 	var retired *http.Transport
 	o.statusClientMu.Lock()
-	if value, ok := o.statusClients.Load(serverName); ok {
-		existing := value.(*statusClientEntry)
+	if existing := o.statusClients[serverName]; existing != nil {
 		if existing.digest == digest {
 			existing.lastUsed.Store(time.Now().UnixNano())
 			o.statusClientMu.Unlock()
@@ -137,7 +132,10 @@ func (o *Observer) statusClient(connection v1.ConnectionParameters, serverName s
 		retired = existing.transport
 	}
 	entry.lastUsed.Store(time.Now().UnixNano())
-	o.statusClients.Store(serverName, entry)
+	if o.statusClients == nil {
+		o.statusClients = make(map[string]*statusClientEntry)
+	}
+	o.statusClients[serverName] = entry
 	o.statusClientMu.Unlock()
 	if retired != nil {
 		retired.CloseIdleConnections()
@@ -147,38 +145,32 @@ func (o *Observer) statusClient(connection v1.ConnectionParameters, serverName s
 
 func (o *Observer) closeStatusClients() {
 	o.statusClientMu.Lock()
-	var retired []*http.Transport
-	o.statusClients.Range(func(key, value any) bool {
-		retired = append(retired, value.(*statusClientEntry).transport)
-		o.statusClients.Delete(key)
-		return true
-	})
+	retired := o.statusClients
+	o.statusClients = nil
 	o.statusClientMu.Unlock()
-	for _, transport := range retired {
-		transport.CloseIdleConnections()
+	for _, entry := range retired {
+		entry.transport.CloseIdleConnections()
 	}
 }
 
 // Bound retained CA/TLS state when demand ends or databases are deleted. The
 // sweep also catches entries created by a probe concurrent with deletion.
 func (o *Observer) pruneConnections(now time.Time) {
-	o.connections.Range(func(key, value any) bool {
-		k := key.(clusterKey)
-		if _, exists := o.cluster(k); !exists || (!o.store.HasDemand(k.namespace, k.name) && now.Sub(value.(cachedConnection).refreshed) >= time.Minute) {
-			o.connections.Delete(key)
+	o.stateMu.Lock()
+	for key := range o.cas {
+		if len(o.demandedCAClusters(key)) == 0 {
+			delete(o.cas, key)
 		}
-		return true
-	})
+	}
+	o.stateMu.Unlock()
 	o.statusClientMu.Lock()
 	var retired []*http.Transport
-	o.statusClients.Range(func(key, value any) bool {
-		entry := value.(*statusClientEntry)
+	for key, entry := range o.statusClients {
 		if now.Sub(time.Unix(0, entry.lastUsed.Load())) >= time.Minute {
 			retired = append(retired, entry.transport)
-			o.statusClients.Delete(key)
+			delete(o.statusClients, key)
 		}
-		return true
-	})
+	}
 	o.statusClientMu.Unlock()
 	for _, transport := range retired {
 		transport.CloseIdleConnections()
@@ -217,10 +209,4 @@ func readStatusHTTP(ctx context.Context, client *http.Client, address string) (i
 		return instanceStatus{}, fmt.Errorf("instance status exceeds size limit")
 	}
 	return decodeStatus(bytes.NewReader(data))
-}
-
-// Ordinary network failures must not cause fleet-wide CA reads during outages.
-func isCertificateError(err error) bool {
-	var verification *tls.CertificateVerificationError
-	return errors.As(err, &verification)
 }

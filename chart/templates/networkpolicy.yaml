@@ -1,0 +1,66 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- if not .Values.networkPolicy.discoveryFrom }}
+{{- fail "networkPolicy.discoveryFrom must explicitly select permitted discovery clients" }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "connect.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "connect.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.operatorPodSelector | nindent 12 }}
+      ports:
+        - {protocol: TCP, port: 9090}
+    - from:
+        {{- toYaml .Values.networkPolicy.discoveryFrom | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8080}
+    {{- with .Values.networkPolicy.monitoringFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8081}
+    {{- end }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - ports:
+        {{- range .Values.networkPolicy.apiServerPorts }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
+      {{- with .Values.networkPolicy.apiServerCIDRs }}
+      to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    - to:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.databaseNamespaceSelector | nindent 12 }}
+          podSelector:
+            matchLabels:
+              cnpg.io/podRole: instance
+      ports:
+        - {protocol: TCP, port: 8000}
+{{- end }}

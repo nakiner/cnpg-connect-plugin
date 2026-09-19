@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -48,6 +49,7 @@ type settings struct {
 	probeTimeout          time.Duration
 	maxConcurrency        int
 	maxConcurrentClusters int
+	limits                server.Limits
 	insecure              bool
 	showVersion           bool
 }
@@ -84,6 +86,12 @@ func parseSettings(args []string, stderr io.Writer) (settings, error) {
 	flags.DurationVar(&s.probeTimeout, "probe-timeout", 2*time.Second, "Timeout for each direct PostgreSQL instance-status request")
 	flags.IntVar(&s.maxConcurrency, "max-concurrency", 128, "Maximum simultaneous PostgreSQL status probes")
 	flags.IntVar(&s.maxConcurrentClusters, "max-concurrent-clusters", 32, "Maximum simultaneous whole-Cluster observations")
+	limits := server.DefaultLimits()
+	flags.IntVar(&s.limits.MaxConcurrentStreams, "max-concurrent-streams", limits.MaxConcurrentStreams, "Maximum discovery streams per HTTP/2 connection")
+	flags.IntVar(&s.limits.MaxConnections, "max-discovery-connections", limits.MaxConnections, "Maximum accepted discovery sockets, including handshakes")
+	flags.IntVar(&s.limits.MaxRPCs, "max-discovery-rpcs", limits.MaxRPCs, "Maximum concurrent discovery RPCs, including incomplete requests")
+	flags.IntVar(&s.limits.MaxWatches, "max-discovery-watches", limits.MaxWatches, "Maximum concurrent discovery watches")
+	flags.DurationVar(&s.limits.InitialRequestTimeout, "initial-request-timeout", limits.InitialRequestTimeout, "Deadline to receive a complete initial discovery request (not watch lifetime)")
 	flags.BoolVar(&s.insecure, "insecure", false, "Local development only: disable TLS and authentication; default addresses bind loopback")
 	flags.BoolVar(&s.showVersion, "version", false, "Print version and exit")
 	if err := flags.Parse(args); err != nil {
@@ -109,6 +117,9 @@ func parseSettings(args []string, stderr io.Writer) (settings, error) {
 }
 
 func (s settings) validate() error {
+	if err := s.limits.Validate(); err != nil {
+		return err
+	}
 	if !(s.kubeAPIQPS > 0) || s.kubeAPIQPS > math.MaxFloat32 || float32(s.kubeAPIQPS) == 0 {
 		return fmt.Errorf("kube-api-qps must be positive, finite and representable as float32")
 	}
@@ -171,6 +182,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		DiscoveryAddress: s.discoveryAddress,
 		HealthAddress:    s.healthAddress,
 		Version:          version,
+		Limits:           s.limits,
 	}
 	var token string
 	if s.insecure {
@@ -214,8 +226,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("create Kubernetes dynamic client: %w", err)
 	}
+	metadataClient, err := metadata.NewForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes metadata client: %w", err)
+	}
 	store := discovery.NewStore()
-	collector, err := observer.New(kubeClient, dynamicClient, store, observer.Options{
+	collector, err := observer.New(kubeClient, dynamicClient, metadataClient, store, observer.Options{
 		Namespace:             s.namespace,
 		PollInterval:          s.pollInterval,
 		TTL:                   s.ttl,
@@ -226,7 +242,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	discoveryServer := discovery.NewServer(store, token)
+	runtimeOptions.AuthorizeDiscovery = discoveryServer.Authorize
 	return server.Run(ctx, runtimeOptions, collector, func(grpcServer *grpc.Server) {
-		connectv1.RegisterTopologyServiceServer(grpcServer, discovery.NewServer(store, token))
+		connectv1.RegisterTopologyServiceServer(grpcServer, discoveryServer)
 	}, logger)
 }

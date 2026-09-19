@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // Server implements application discovery separately from the CNPG-I interface.
@@ -92,6 +93,10 @@ func (s *Server) WatchTopology(request *connectv1.WatchTopologyRequest, stream c
 	}
 }
 
+// Authorize is also installed at transport admission, before gRPC decodes the
+// initial request. Handler checks remain as defense for direct/embedded callers.
+func (s *Server) Authorize(ctx context.Context) error { return s.authorize(ctx) }
+
 func (s *Server) authorize(ctx context.Context) error {
 	if !s.authenticated {
 		return nil
@@ -117,21 +122,15 @@ func validateReference(namespace, name string) error {
 }
 
 func validDNSName(value string, dots bool) bool {
-	if value == "" || len(value) > 253 || (!dots && len(value) > 63) {
+	if !dots {
+		return len(validation.IsDNS1123Label(value)) == 0
+	}
+	if len(value) > validation.DNS1123SubdomainMaxLength {
 		return false
 	}
-	labels := strings.Split(value, ".")
-	if !dots && len(labels) != 1 {
-		return false
-	}
-	for _, label := range labels {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+	for _, label := range strings.Split(value, ".") {
+		if len(validation.IsDNS1123Label(label)) != 0 {
 			return false
-		}
-		for _, character := range label {
-			if character != '-' && (character < 'a' || character > 'z') && (character < '0' || character > '9') {
-				return false
-			}
 		}
 	}
 	return true

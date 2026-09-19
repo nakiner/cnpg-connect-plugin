@@ -6,6 +6,8 @@ image:
   repository: ghcr.io/nakiner/cnpg-connect-plugin
   # Defaults to the chart appVersion. Override for a custom image build.
   tag: ""
+  # When set, digest takes precedence over tag. Release charts pin this value.
+  digest: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
@@ -46,6 +48,14 @@ application:
     port: 443
     annotations: {}
     loadBalancerSourceRanges: []
+  limits:
+    # Per replica, including reconnect/rollout overlap. A watch consumes both
+    # RPC and watch capacity; independent clients also consume connections.
+    maxConcurrentStreams: 128
+    maxConnections: 1024
+    maxRPCs: 4096
+    maxWatches: 2048
+    initialRequestTimeout: 5s
   auth:
     # Optional legacy shared token. Read-only discovery is tokenless by default.
     existingSecret: ""
@@ -82,7 +92,30 @@ tls:
   clusterDomain: cluster.local
 
 podAnnotations: {}
-# Go 1.26 derives GOMAXPROCS from the CPU limit automatically. Do not set a
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+terminationGracePeriodSeconds: 30
+topologySpreadConstraints: []
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+# Requires a CNI implementing NetworkPolicy and explicitly permitted clients.
+networkPolicy:
+  enabled: false
+  discoveryFrom: []
+  monitoringFrom: []
+  operatorPodSelector:
+    matchLabels:
+      app.kubernetes.io/name: cloudnative-pg
+  databaseNamespaceSelector: {}
+  # Account for service-port and post-DNAT control-plane enforcement by the CNI.
+  apiServerPorts: [443, 6443]
+  # Empty permits the configured ports to all IPs; restrict to control-plane IPs.
+  apiServerCIDRs: []
+# Go 1.26+ derives GOMAXPROCS from the CPU limit automatically. Do not set a
 # fixed GOMAXPROCS env var; it would disable runtime adjustment to limit changes.
 # Requests reserve scheduling capacity; they do not configure GOMAXPROCS.
 resources:

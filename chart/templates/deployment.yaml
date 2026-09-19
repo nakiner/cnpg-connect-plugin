@@ -7,6 +7,8 @@ metadata:
     {{- include "connect.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
   selector:
     matchLabels:
       {{- include "connect.selectorLabels" . | nindent 6 }}
@@ -21,7 +23,11 @@ spec:
     spec:
       serviceAccountName: {{ include "connect.serviceAccount" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -35,12 +41,17 @@ spec:
       {{- end }}
       containers:
         - name: plugin
-          image: {{ printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) | quote }}
+          image: {{ include "connect.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --plugin-address=:9090
             - --discovery-address=:8080
             - --health-address=:8081
+            - --max-concurrent-streams={{ .Values.application.limits.maxConcurrentStreams }}
+            - --max-discovery-connections={{ .Values.application.limits.maxConnections }}
+            - --max-discovery-rpcs={{ .Values.application.limits.maxRPCs }}
+            - --max-discovery-watches={{ .Values.application.limits.maxWatches }}
+            - --initial-request-timeout={{ .Values.application.limits.initialRequestTimeout }}
             - --server-cert=/tls/plugin/tls.crt
             - --server-key=/tls/plugin/tls.key
             - --client-ca=/tls/client/ca.crt

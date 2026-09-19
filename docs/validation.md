@@ -1,5 +1,34 @@
 # Validation record
 
+## September 19, 2026: Secret watches and dependency adoption
+
+The current plugin/client pair passed eight suites with no failures or skips in
+a disposable kind cluster: Kubernetes 1.34.0, unmodified CNPG 1.30.0, PostgreSQL
+18.4, two plugin replicas and three database instances, using Go 1.27.1.
+The runner removed its owned cluster after collecting both replicas' metrics.
+No production cluster was changed.
+
+A CA Secret bundle update reached an existing gRPC stream in 38.3 ms while the
+Cluster's certificate metadata stayed unchanged. The test retained the existing
+root and restored the bundle afterward; it tests Secret-event delivery, not a
+complete root-CA migration. Discovery leaf renewal passed on both replicas.
+Three client lifecycle runs preserved the same pgx, database/sql and prepared
+statement handles through switchover and primary Pod deletion. Discovery outage
+and stalled-connection recovery also passed. See [performance](performance.md)
+for measured recovery times and their limits.
+
+Plugin `make check race build`, client `make check`, source/binary govulncheck,
+Helm checks, ShellCheck, actionlint, and tagged integration compilation passed.
+Cold-start and 6,000-Cluster synthetic tests passed; 500 Clusters sharing a CA
+required one Secret GET. Regression tests cover Secret-only rotations,
+deletion/recreation, late reads/publications, idle-snapshot invalidation, retry
+pacing, pool ownership, and borrowed connections during native pgx Reset.
+
+The chart now needs Secret `list/watch` permissions alongside `get`. Upgrade
+the chart with the image, or update manually managed RBAC. The protobuf API and
+application configuration remain compatible. These results do not establish
+production fleet capacity or validate an external gateway/network partition.
+
 ## September 18, 2026: unreleased scalability improvements
 
 Current source after `0.0.5` passed `make check race build`: formatting, vet,

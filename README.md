@@ -34,7 +34,7 @@ The watch-driven observer and priority scheduling described here are available i
 
 The operator installs discovery once. Applications then use the three settings above. You need CNPG 1.30.0, Helm with OCI support, cert-manager, and an HTTP/2-capable Gateway with a publicly trusted certificate for the discovery hostname. Existing TLS Secrets can replace cert-manager; see [certificate options](docs/deployment.md#certificates).
 
-The example uses release `connect` in the operator namespace `cnpg-system`, watching an existing database namespace `databases`. Keep one release per CNPG operator installation; use `replicaCount` for additional replicas.
+The example uses release `connect` in the operator namespace `cnpg-system`, watching an existing database namespace `databases`, with `fullnameOverride: cnpg-connect`. Without that override, the chart names resources `connect-cnpg-connect-plugin` and discovery Service `connect-cnpg-connect-plugin-api`. Keep one release per CNPG operator installation; use `replicaCount` for additional replicas.
 
 ### 1. Install the plugin
 
@@ -97,7 +97,7 @@ The plugin reads the database name from CNPG bootstrap configuration and the pub
 
 Automatic observation stays outside CNPG's reconciliation path, so discovery outages do not add a dependency to CNPG failover. Explicit opt-out, optional endpoint parameters, and native CNPG-I enrollment are covered in [observation modes](docs/deployment.md#observation-modes-and-cnpg-availability).
 
-The library tries an instance's internal address first, then its advertised external address when needed. Applications do not need a network setting. The operator provides reachable per-instance external endpoints when applications cannot reach the Pod network; see [external PostgreSQL endpoints](docs/deployment.md#external-clients-and-database-addresses).
+The library initially tries an instance's internal address first, then its advertised external address when needed. Updated clients temporarily prefer a verified successful external path within the pool, scoped to the target generation, and retry the internal path after one minute. Applications do not need a network setting. The operator provides reachable per-instance external endpoints when applications cannot reach the Pod network; see [external PostgreSQL endpoints](docs/deployment.md#external-clients-and-database-addresses).
 
 ## Verify discovery
 
@@ -147,11 +147,15 @@ flowchart LR
 | --- | --- | --- |
 | CNPG-I `:9090` | `cnpg-connect:9090` | Operator integration with mutual TLS |
 | Discovery `:8080` | `cnpg-connect-api:443` | Application gRPC API; TLS or internal h2c behind a TLS Gateway |
-| Health `:8081` | No Service | Kubernetes HTTP liveness/readiness probes |
+| Health `:8081` | No Service | Kubernetes HTTP probes and private [operational metrics](docs/metrics.md) |
+
+For the unreleased hardening changes, see [production operations](docs/production.md),
+the [immutable release contract](docs/releases.md), and the
+[isolated lifecycle gate](test/e2e/README.md#isolated-qualification-runner).
 
 Shared Kubernetes watches maintain Cluster and CNPG Pod metadata in memory. A change queues only the affected Cluster; there is no periodic global rescan or fixed 100 ms event delay. Instance status collection runs only for Clusters with discovery consumers, and one collection serves all subscribers to that Cluster.
 
-Primary/routing changes cancel obsolete in-flight collections. A share of the worker and probe limits is reserved for urgent events, so unrelated slow background checks cannot occupy all capacity. With the defaults, four of the 32 workers and 16 of the 128 probe slots are reserved; the limits include these reservations. Replica verification and conflicting-primary checks still run before a usable topology is published.
+Primary/routing changes cancel obsolete in-flight collections. A share of the worker and probe limits is reserved for urgent events, so unrelated slow background checks cannot occupy all capacity. With the defaults, four of the 32 workers and 16 of the 128 probe slots are reserved; the limits include these reservations. Only verified eligible members are published as usable; unsuccessful or incomplete probes cannot establish eligibility, and conflicting-primary evidence blocks availability until safely resolved.
 
 CNPG 1.30 does not publish actual synchronous/asynchronous replication state through a stream. The plugin therefore checks `/pg/status` directly on active Clusters' instances, immediately after relevant events and periodically for changes that have no Kubernetes event. These bounded checks use the existing PostgreSQL CA for HTTPS, bypass the Kubernetes API proxy, and need no database password or client certificate. The client-facing API remains a gRPC stream. See [event delivery and scaling](docs/deployment.md#event-delivery-and-scaling).
 
@@ -168,7 +172,7 @@ Two live switchovers on **CNPG 1.30.0**, measured on September 18, 2026, compare
 
 Each pair is the forward and return switchover. The client version, plugin resources, and CNPG lease configuration also changed; this is a before/after system comparison. The new plugin's status observations took **44 / 42 ms**; the application's new PostgreSQL sessions started about **2 ms after** a separate subscriber received the discovery update. CNPG promotion, plugin observation, and application recovery are distinct stages. Both versions used a `5s` background refresh interval; watched primary changes trigger immediate work.
 
-A separate synthetic test used **6,000 Clusters, 18,000 simulated instances, and 6,000 gRPC streams** with **2 CPUs / 2 GiB**. With warm caches, simulated 20 ms status responses, and the `5s` refresh setting, event-to-stream latency was **28.3 ms p95 / 37.8 ms p99**; the median observed refresh gap was **5.08 s**. Streams shared one in-memory transport, so this does not establish production fleet capacity or a strict 50 ms bound.
+A separate synthetic test used **6,000 Clusters, 18,000 simulated instances, and 6,000 gRPC streams** with **2 CPUs / 2 GiB**. With warm caches, simulated 20 ms status responses, and the `5s` refresh setting, event-to-stream latency was **28.3 ms p95 / 37.8 ms p99**; the median observed refresh gap was **5.08 s**. Streams shared one in-memory transport and bypassed the current production admission controls, so this does not establish capacity for 6,000 independent clients or a strict 50 ms bound.
 
 Current source adds cold-start budgeting, shared immutable gRPC fan-out, and prompt cancellation after primary verification fails; these changes are not included in `0.0.5`. See the [performance guide](docs/performance.md) for the full comparison, current scalability tests, measurement boundaries, and reproducible load-test commands. Use [capacity planning](docs/deployment.md#capacity-planning) to size your deployment.
 
@@ -182,10 +186,13 @@ See [chart/values.yaml](chart/values.yaml) for all values and [runtime flags](do
 | `watchNamespace` | Empty | One namespace, or all namespaces when empty |
 | `replicaCount` | `1` | Independent observer replicas |
 | `image.repository`, `image.tag` | GHCR image, matching chart release | Override when testing a local/custom build |
+| `image.digest` | Empty in source; release chart pins its published image | Takes precedence over `image.tag`; clear when switching to a custom tag |
 | `application.service.type`, `.port` | `ClusterIP`, `443` | Discovery Service |
 | `tls.application.enabled` | `true` | Disable for an internal h2c backend behind a TLS Gateway |
 | `tls.application.existingSecret` | Empty | Existing discovery server certificate when plugin TLS is enabled |
 | `application.auth.existingSecret`, `.key` | Empty, `token` | Optional bearer authentication; empty means no token required |
+| `application.limits.maxConnections`, `.maxRPCs`, `.maxWatches` | `1024`, `4096`, `2048` | Per-replica admission; each active watch consumes RPC and watch capacity |
+| `application.limits.maxConcurrentStreams`, `.initialRequestTimeout` | `128`, `5s` | HTTP/2 streams per connection and initial request-body deadline |
 | `tls.certManager.enabled`, `.createIssuer` | `true`, `true` | Generate CNPG-I and, when enabled, discovery certificates |
 | `observer.pollInterval`, `.ttl`, `.probeTimeout` | `5s`, `15s`, `2s` | Active Cluster status refresh, snapshot expiry/unary demand lease, and direct instance request timeout |
 | `observer.maxConcurrency` | `128` | Maximum parallel instance probes across active Clusters |
@@ -219,9 +226,9 @@ Existing installations that set `application.auth.existingSecret` retain bearer 
 
 Additional replicas keep independent watches and observe the Clusters requested by their own clients. Work is shared between subscribers within a replica, but not across replicas. Streams reconnect to any healthy replica and receive a complete snapshot. The chart does not create a PodDisruptionBudget, HPA, or NetworkPolicy. See [deployment and operations](docs/deployment.md) for certificate rotation, private endpoint configurations, network behavior, and RBAC details.
 
-For thousands of databases, budget status traffic by active instance count, not service count: approximately `active instances / refresh interval` requests per second per plugin replica. See [capacity planning](docs/deployment.md#capacity-planning) for concurrency, startup CA reads, memory, and the limits of the synthetic scale test. A [large-installation values example](examples/values-large.yaml) provides API startup and resource budgets without changing application configuration.
+For thousands of databases, budget status traffic by active instance count, not service count: approximately `active instances / refresh interval` requests per second per plugin replica. Separately size application admission for actual connections and watches, including surviving-replica and rollout load: defaults are 1,024 connections and 2,048 watches per replica. See [adopting these changes](docs/production.md#adopting-these-changes) and [capacity planning](docs/deployment.md#capacity-planning). The [large-installation values example](examples/values-large.yaml) sizes observer/API resources; it still needs admission limits appropriate to your client count.
 
-`observer.pollInterval: 100ms` is supported, but it is a delay between collections, not a fleet-wide freshness guarantee. At 6,000 active three-instance Clusters, refreshing every instance ten times a second would require about 180,000 status requests/second. Primary-change events use the priority queue immediately. Go 1.26 reads the container CPU limit automatically; leave `GOMAXPROCS` unset. The [capacity guide](docs/deployment.md#capacity-planning) explains the measured difference between event latency and periodic refresh latency.
+`observer.pollInterval: 100ms` is supported, but it is a delay between collections, not a fleet-wide freshness guarantee. At 6,000 active three-instance Clusters, refreshing every instance ten times a second would require about 180,000 status requests/second. Primary-change events use the priority queue immediately. Go 1.26+ reads the container CPU limit automatically; leave `GOMAXPROCS` unset. The [capacity guide](docs/deployment.md#capacity-planning) explains the measured difference between event latency and periodic refresh latency.
 
 ## Troubleshooting
 
@@ -243,9 +250,10 @@ For thousands of databases, budget status traffic by active instance count, not 
 
 ## Run this checkout
 
-Building requires Go **1.26.4+**. Run the local checks with:
+Building this source and the matching client requires Go **1.27.1+**. Chart checks also use Helm, jq, and the Go-based [yq](https://github.com/mikefarah/yq). Update application build images and CI toolchains before upgrading the library; protobuf compatibility does not imply compiler compatibility. Run the local checks with:
 
 ```sh
+go install github.com/mikefarah/yq/v4@v4.47.2
 make build
 make check
 make race
@@ -261,6 +269,7 @@ helm upgrade --install connect ./chart \
   -f examples/values-gateway.yaml \
   --set image.repository=registry.example.com/cnpg-connect-plugin \
   --set-string image.tag=dev \
+  --set-string image.digest= \
   --wait --timeout 5m
 ```
 
@@ -282,6 +291,31 @@ For a local observer, use an explicit kubeconfig:
 The observer process must be able to route to database Pod IPs on TCP 8000. A laptop kubeconfig alone does not provide that route; run the observer in Kubernetes or connect the local process to the Pod network.
 
 `make generate` regenerates the protocol bindings with pinned Go generators under `work/bin`. The [release workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml) publishes versioned GHCR images and OCI charts. See [release instructions](docs/releasing.md), the [validation record](docs/validation.md), and [opt-in integration tests](test/e2e/README.md).
+
+## Working on the code
+
+| Package | Responsibility |
+| --- | --- |
+| `internal/observer` | Kubernetes informers, bounded instance probes, and CNPG role evidence |
+| `internal/discovery` | Current topology, expiry, coalesced subscriptions, and protobuf delivery |
+| `internal/server` | Listener lifetime, TLS, request admission, and metrics |
+| `internal/plugin` | CNPG-I registration and reconciliation hooks |
+
+Kubernetes client-go handles Cluster, Pod, and Secret metadata watches and recovery.
+Public CA certificates are refreshed by Secret events, without a polling timer.
+VictoriaMetrics/metrics handles Prometheus exposition and histograms. Application
+discovery and CNPG-I both use gRPC. The discovery server uses Go's HTTP/2 transport
+to enforce stream write deadlines. CNPG's instance status endpoint and
+Prometheus/health endpoints use HTTP. The custom queue gives metadata changes
+priority over ordinary refreshes, and the store keeps only the latest pending snapshot per subscriber.
+Those behaviors are specific to discovery and bounded recovery.
+
+The [complete isolated flow](test/e2e/README.md#run-the-complete-isolated-flow)
+tests the plugin and client together. Go tests beside each package cover states
+that a real cluster cannot reproduce reliably on demand: conflicting primary
+evidence, stale observations, cancellation races, and blocked HTTP/2 writers.
+Scripts only prepare fixtures, run those suites, or package releases. They use
+Bash and existing CLI tools; all application and protocol assertions stay in Go.
 
 ## Uninstall
 

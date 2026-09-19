@@ -28,6 +28,7 @@ import (
 	clientfeatures "k8s.io/client-go/features"
 	clientfeaturestesting "k8s.io/client-go/features/testing"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	metadatafake "k8s.io/client-go/metadata/fake"
 )
 
 func fakeObserver(t *testing.T) (*Observer, *kubefake.Clientset, *fake.FakeDynamicClient) {
@@ -42,14 +43,20 @@ func fakeObserver(t *testing.T) (*Observer, *kubefake.Clientset, *fake.FakeDynam
 	for i := range pods {
 		objects = append(objects, &pods[i])
 	}
-	objects = append(objects, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test"}, Data: map[string][]byte{"ca.crt": testPublicCA(t)}})
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "db-ca", Namespace: "test", UID: "ca-uid", ResourceVersion: "1"}, Data: map[string][]byte{"ca.crt": testPublicCA(t)}}
+	objects = append(objects, secret)
 	kube := kubefake.NewSimpleClientset(objects...)
+	metaScheme := runtime.NewScheme()
+	metaScheme.AddKnownTypeWithName(corev1.SchemeGroupVersion.WithKind("Secret"), &metav1.PartialObjectMetadata{})
+	meta := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: secret.ObjectMeta}
+	metaClient := metadatafake.NewSimpleMetadataClient(metaScheme, meta)
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{clusterResource: "ClusterList"}, cluster)
-	o, err := New(kube, dyn, discovery.NewStore(), Options{PollInterval: time.Second, TTL: 10 * time.Second, ProbeTimeout: time.Second, MaxConcurrency: 2}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o, err := New(kube, dyn, metaClient, discovery.NewStore(), Options{PollInterval: time.Second, TTL: 10 * time.Second, ProbeTimeout: time.Second, MaxConcurrency: 2}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = o.clusterInformer.GetIndexer().Add(cluster.DeepCopy())
+	installTestCA(t, o, secret)
 	for i := range pods {
 		_ = o.podInformer.GetIndexer().Add(pods[i].DeepCopy())
 	}
@@ -57,6 +64,7 @@ func fakeObserver(t *testing.T) (*Observer, *kubefake.Clientset, *fake.FakeDynam
 	o.ready.Store(true)
 	o.clusterWatch.Store(true)
 	o.podWatch.Store(true)
+	o.secretWatch.Store(true)
 	o.probe = func(_ context.Context, pod *corev1.Pod, _ v1.ConnectionParameters, _ string) (instanceStatus, error) {
 		for i := range pods {
 			if pods[i].Name == pod.Name {
@@ -65,7 +73,7 @@ func fakeObserver(t *testing.T) (*Observer, *kubefake.Clientset, *fake.FakeDynam
 		}
 		return instanceStatus{}, errors.New("not found")
 	}
-	t.Cleanup(func() { o.queue.ShutDown(); o.closeStatusClients() })
+	t.Cleanup(func() { o.queue.ShutDown(); o.caQueue.ShutDown(); o.closeStatusClients() })
 	return o, kube, dyn
 }
 func observe(t *testing.T, o *Observer) {
@@ -169,8 +177,8 @@ func TestObservationUsesCachedMetadataAndCA(t *testing.T) {
 		t.Fatal("observation reread cluster metadata from API")
 	}
 	actions := kube.Actions()
-	if len(actions) != 1 || actions[0].GetResource().Resource != "secrets" {
-		t.Fatalf("expected one initial CA lookup, got %+v", actions)
+	if len(actions) != 0 {
+		t.Fatalf("warm observation read the Kubernetes API: %+v", actions)
 	}
 }
 func TestClusterDeleteAndOptOut(t *testing.T) {
@@ -217,25 +225,31 @@ func TestDisconnectedWatchDoesNotRenewCachedTopology(t *testing.T) {
 }
 func TestTrackedWatchDisconnectAndReconnect(t *testing.T) {
 	o, _, _ := fakeObserver(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	source := watch.NewRaceFreeFake()
 	var healthy atomic.Bool
-	tracked := o.trackWatch(ctx, source, &healthy)
-	if !healthy.Load() {
-		t.Fatal("watch not connected")
-	}
-	source.Stop()
-	for range tracked.ResultChan() {
-	}
-	waitFor(t, func() bool { return !healthy.Load() })
-	source = watch.NewRaceFreeFake()
-	tracked = o.trackWatch(ctx, source, &healthy)
-	if !healthy.Load() {
-		t.Fatal("watch did not recover")
-	}
-	tracked.Stop()
-	for range tracked.ResultChan() {
+	for _, reason := range []string{"disconnect", "stop", "cancel with pending event"} {
+		t.Run(reason, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			source := watch.NewRaceFreeFake()
+			tracked := o.trackWatch(ctx, source, &healthy, cancel)
+			if !healthy.Load() {
+				t.Fatal("watch did not connect or recover")
+			}
+			switch reason {
+			case "disconnect":
+				source.Stop()
+			case "stop":
+				tracked.Stop()
+			case "cancel with pending event":
+				source.Add(&corev1.Pod{})
+				cancel()
+			}
+			for range tracked.ResultChan() {
+			}
+			if healthy.Load() || !source.IsStopped() || ctx.Err() == nil {
+				t.Fatal("closed watch retained health, source, or its request context")
+			}
+		})
 	}
 }
 func TestChangedPrimaryDuringProbeIsNotPublished(t *testing.T) {
@@ -365,7 +379,7 @@ func TestDirectStatusHTTPValidatesPayload(t *testing.T) {
 }
 func TestInvalidOptions(t *testing.T) {
 	o, _, _ := fakeObserver(t)
-	_, err := New(o.kube, o.dynamic, o.store, Options{PollInterval: time.Second, TTL: time.Second, ProbeTimeout: time.Second, MaxConcurrency: 1}, nil)
+	_, err := New(o.kube, o.dynamic, o.metadata, o.store, Options{PollInterval: time.Second, TTL: time.Second, ProbeTimeout: time.Second, MaxConcurrency: 1}, nil)
 	if err == nil || !strings.Contains(err.Error(), "ttl") {
 		t.Fatal("accepted unsafe TTL")
 	}
@@ -388,9 +402,10 @@ func TestConcurrentClusterLimitOptions(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			options := base.opts
 			options.MaxConcurrentClusters = test.limit
-			observer, err := New(base.kube, base.dynamic, discovery.NewStore(), options, nil)
+			observer, err := New(base.kube, base.dynamic, base.metadata, discovery.NewStore(), options, nil)
 			if observer != nil {
 				t.Cleanup(observer.queue.ShutDown)
+				t.Cleanup(observer.caQueue.ShutDown)
 			}
 			if test.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "max concurrent clusters") {

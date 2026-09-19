@@ -17,7 +17,6 @@ import (
 	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -34,7 +33,7 @@ func TestColdStartFleet(t *testing.T) {
 	}{
 		{name: "500_unique_CA", count: 500},
 		{name: "1000_unique_CA", count: 1000},
-		{name: "500_shared_CA_and_metadata", count: 500, shared: true},
+		{name: "500_shared_CA", count: 500, shared: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			runColdStartFleet(t, scenario.count, scenario.shared)
@@ -53,14 +52,6 @@ func runColdStartFleet(t *testing.T, count int, shared bool) {
 	o.opts.MaxConcurrency = 128
 	o.configureProbeLimits()
 	public := testPublicCA(t)
-	encodedSecret, err := json.Marshal(corev1.Secret{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{Namespace: "test"},
-		Data:       map[string][]byte{"ca.crt": public},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var requests, activeRequests, peakRequests atomic.Int64
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/test/secrets/cold-") {
@@ -84,9 +75,15 @@ func runColdStartFleet(t *testing.T, count int, shared bool) {
 		case <-timer.C:
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(encodedSecret)
+		name := strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/test/secrets/")
+		_ = json.NewEncoder(w).Encode(corev1.Secret{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: name, UID: types.UID(name), ResourceVersion: "1"},
+			Data:       map[string][]byte{"ca.crt": public},
+		})
 	}))
 	defer api.Close()
+	var err error
 	o.kube, err = kubernetes.NewForConfig(&rest.Config{Host: api.URL, QPS: qps, Burst: burst})
 	if err != nil {
 		t.Fatal(err)
@@ -99,42 +96,23 @@ func runColdStartFleet(t *testing.T, count int, shared bool) {
 			return instanceStatus{}, ctx.Err()
 		case <-timer.C:
 		}
-		primary := strings.HasSuffix(pod.Name, "-1")
-		result := instanceStatus{IsPrimary: &primary, SystemID: "cold", Timeline: 1, WalReceiverActive: !primary}
-		if primary {
-			name := pod.OwnerReferences[0].Name
-			for _, suffix := range []string{"-2", "-3"} {
-				result.Replication = append(result.Replication, replicationStatus{ApplicationName: name + suffix, State: "streaming", SyncState: "sync"})
-			}
-		}
-		return result, nil
+		return fleetStatus(pod, "-1", "cold"), nil
 	}
-	template, _ := o.cluster(clusterKey{"test", "db"})
 	var subscriptions []<-chan v1.Snapshot
 	var cancels []func()
 	for i := range count {
 		name := fmt.Sprintf("cold-%04d", i)
-		cluster := template.DeepCopy()
-		cluster.SetName(name)
-		cluster.SetUID(types.UID(name))
-		_ = unstructured.SetNestedField(cluster.Object, name+"-1", "status", "currentPrimary")
-		_ = unstructured.SetNestedField(cluster.Object, name+"-1", "status", "targetPrimary")
 		secret := name + "-ca"
 		if shared {
 			secret = "cold-shared-ca"
 		}
-		_ = unstructured.SetNestedField(cluster.Object, secret, "status", "certificates", "serverCASecret")
-		_ = o.clusterInformer.GetIndexer().Add(cluster)
-		o.clusterEvent(nil, cluster)
-		_, pods, _ := fixture()
-		for j := range pods {
-			pods[j].Name = fmt.Sprintf("%s-%d", name, j+1)
-			pods[j].UID = types.UID(pods[j].Name)
-			pods[j].Labels["cnpg.io/cluster"] = name
-			pods[j].OwnerReferences[0].Name = name
-			pods[j].OwnerReferences[0].UID = types.UID(name)
-			_ = o.podInformer.GetIndexer().Add(&pods[j])
+		cluster, _, _ := addFleetCluster(t, o, name, secret)
+		if err := o.secretInformer.GetIndexer().Add(&metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test", Name: secret, UID: types.UID(secret), ResourceVersion: "1",
+		}}); err != nil {
+			t.Fatal(err)
 		}
+		o.clusterEvent(nil, cluster)
 		stream, cancel := o.store.Subscribe("test", name)
 		subscriptions = append(subscriptions, stream)
 		cancels = append(cancels, cancel)
@@ -183,8 +161,8 @@ func runColdStartFleet(t *testing.T, count int, shared bool) {
 	if !shared && requests.Load() != int64(count) {
 		t.Fatalf("unique CA reads=%d, want one per database (%d)", requests.Load(), count)
 	}
-	if shared && requests.Load() >= int64(count) {
-		t.Fatal("identical overlapping CA reads were not coalesced")
+	if shared && requests.Load() != 1 {
+		t.Fatalf("shared CA reads=%d, want one per Secret version", requests.Load())
 	}
 	if peakRequests.Load() > int64(o.opts.MaxConcurrentClusters) {
 		t.Fatalf("CA request concurrency=%d exceeds worker bound", peakRequests.Load())
@@ -192,7 +170,7 @@ func runColdStartFleet(t *testing.T, count int, shared bool) {
 	if !shared && float64(requests.Load()) > burst+qps*elapsed.Seconds()+1 {
 		t.Fatal("requests exceeded the configured client-go API budget")
 	}
-	t.Logf("databases=%d shared_CA_and_metadata=%t kube_qps=%d kube_burst=%d API_RTT=%s status_RTT=%s CA_GETs=%d peak_CA_requests=%d cold_to_available_p50=%s p95=%s max=%s elapsed=%s",
+	t.Logf("databases=%d shared_CA=%t kube_qps=%d kube_burst=%d API_RTT=%s status_RTT=%s CA_GETs=%d peak_CA_requests=%d cold_to_available_p50=%s p95=%s max=%s elapsed=%s",
 		count, shared, qps, burst, apiLatency, statusLatency, requests.Load(), peakRequests.Load(),
 		percentile(latencies, .5), percentile(latencies, .95), percentile(latencies, 1), elapsed)
 }

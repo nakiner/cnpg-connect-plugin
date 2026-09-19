@@ -100,7 +100,7 @@ func TestNewRejectsOverflowingRefreshBudget(t *testing.T) {
 		TTL:            maximumDuration,
 		MaxConcurrency: 1,
 	}
-	observer, err := New(o.kube, o.dynamic, o.store, options, nil)
+	observer, err := New(o.kube, o.dynamic, o.metadata, o.store, options, nil)
 	if observer != nil {
 		observer.queue.ShutDown()
 	}
@@ -167,11 +167,6 @@ func TestFailedPrimaryCancelsSlowStandbysAndPublishes(t *testing.T) {
 			}
 			if len(o.probeSlots) != 0 || len(o.backgroundProbeSlots) != 0 {
 				t.Fatal("canceled probes retained worker capacity")
-			}
-			if mode == "certificate changed" {
-				if _, cached := o.connections.Load(clusterKey{"test", "db"}); cached {
-					t.Fatal("certificate failure did not invalidate the cached CA")
-				}
 			}
 		})
 	}

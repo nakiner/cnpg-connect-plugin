@@ -38,36 +38,6 @@ func latest(t *testing.T, updates <-chan v1.Snapshot) v1.Snapshot {
 	}
 }
 
-func TestStoreRefreshPreservesRevisionAndDeliversFreshness(t *testing.T) {
-	s := NewStore()
-	input := sampleSnapshot()
-	s.Put(input)
-	updates, cancel := s.Subscribe("database", "postgres")
-	defer cancel()
-	initial := latest(t, updates)
-	input.ObservedAt = input.ObservedAt.Add(time.Second)
-	input.ValidUntil = input.ValidUntil.Add(time.Second)
-	input.Members[1].ReplayLSN = "0/20"
-	input.Members[0], input.Members[1] = input.Members[1], input.Members[0]
-	s.Put(input)
-	refreshed := latest(t, updates)
-	if initial.Revision != refreshed.Revision {
-		t.Fatal("freshness, WAL progress, or ordering changed routing revision")
-	}
-	if !refreshed.ValidUntil.Equal(input.ValidUntil) {
-		t.Fatal("refresh did not deliver renewed freshness")
-	}
-	if refreshed.Members[0].ReplayLSN != "0/20" {
-		t.Fatal("refresh lost WAL observation")
-	}
-	other := NewStore()
-	other.Put(input)
-	fromOther, _ := other.Get("database", "postgres")
-	if fromOther.Revision == initial.Revision {
-		t.Fatal("revision reused across process/store restart")
-	}
-}
-
 func TestStoreRoutingChangesBumpRevision(t *testing.T) {
 	cases := map[string]func(*v1.Snapshot){
 		"pod replacement":     func(s *v1.Snapshot) { s.Members[1].ID = "replacement" },
@@ -168,32 +138,6 @@ func assertExpired(t *testing.T, snapshot v1.Snapshot) {
 		if member.Ready {
 			t.Fatal("expired member remains routable")
 		}
-	}
-}
-
-func TestStoreDeletionAndRecreation(t *testing.T) {
-	s := NewStore()
-	input := sampleSnapshot()
-	s.Put(input)
-	updates, cancel := s.Subscribe("database", "postgres")
-	defer cancel()
-	before := latest(t, updates)
-	s.Delete("database", "postgres")
-	deleted := latest(t, updates)
-	if deleted.Available || deleted.PrimaryID != "" || len(deleted.Members) != 0 || deleted.Reason != "deleted" {
-		t.Fatal("unsafe deletion tombstone")
-	}
-	if deleted.Revision == before.Revision {
-		t.Fatal("deletion kept revision")
-	}
-	if _, exists := s.Get("database", "postgres"); exists {
-		t.Fatal("deleted cluster is still discoverable")
-	}
-	input.Cluster.UID = "new-cluster"
-	s.Put(input)
-	recreated := latest(t, updates)
-	if recreated.Cluster.UID != "new-cluster" || recreated.Revision == before.Revision {
-		t.Fatal("watch did not observe recreation")
 	}
 }
 

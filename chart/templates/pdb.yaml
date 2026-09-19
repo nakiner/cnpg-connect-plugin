@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- if or (lt (int .Values.replicaCount) 2) (ge (int .Values.podDisruptionBudget.minAvailable) (int .Values.replicaCount)) }}
+{{- fail "podDisruptionBudget requires replicaCount >= 2 and minAvailable < replicaCount" }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "connect.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "connect.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "connect.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -8,7 +8,9 @@ The [release workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/wo
 | Helm OCI chart | `oci://ghcr.io/nakiner/charts/cnpg-connect-plugin`, version `VERSION` |
 | Image platforms | `linux/amd64`, `linux/arm64` |
 
-The source tag has a leading `v`; image tags, chart versions, and chart `appVersion` omit it. The chart selects the corresponding image automatically. Chart and image use separate package paths, so their tags do not collide. No Helm repository index is needed; see [Helm OCI registries](https://helm.sh/docs/v3/topics/registries/).
+The source tag has a leading `v`; image tags, chart versions, and chart `appVersion` omit it. The chart selects the corresponding image automatically. New releases pin the actual multiarchitecture image digest in `image.digest`; this takes precedence over `image.tag`. Clear `image.digest` explicitly when overriding a release chart with a custom image tag. Chart and image use separate package paths, so their tags do not collide. No Helm repository index is needed; see [Helm OCI registries](https://helm.sh/docs/v3/topics/registries/).
+
+This page covers publication and installation commands. The [release checks](releases.md) describe validation, version reservations and partial failures. These workflow changes are unreleased until committed and published.
 
 ## Protocol and runtime compatibility
 
@@ -24,7 +26,7 @@ To test future changes before publication, [build the checkout's image and local
 
 ## Repository setup
 
-The workflow uses `GITHUB_TOKEN` with `contents: read` and `packages: write`; no custom registry-password Secret is needed. Repository/organization policy must allow Actions and package publication. If packages already exist outside this repository's ownership, connect them or grant the repository Actions write access in their settings. See [GitHub package workflow authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-in-a-github-actions-workflow).
+The publication job uses `GITHUB_TOKEN` with `contents: write` to create its release and `packages: write` to publish artifacts; no custom registry-password Secret is needed. Repository/organization policy must allow these permissions. If packages already exist outside this repository's ownership, connect them or grant the repository Actions write access in their settings. See [GitHub package workflow authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-in-a-github-actions-workflow).
 
 ## Publish a version
 
@@ -38,9 +40,9 @@ git push origin "v${CNPG_CONNECT_VERSION}"
 
 The tagged source must contain the workflow. Prerelease suffixes are supported; `+build` metadata is not. The workflow derives packaged chart/image versions from the tag, so release packaging does not require changing every checked-in version field.
 
-For an existing tag or a failed publication, open [the workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml), choose **Run workflow**, and set its **tag** input. The workflow definition, Dockerfile, and packaging helper come from the selected branch; application and chart source come from the requested tag. The workflow does not move the tag. See [manual workflow runs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+To publish an existing **unpublished** tag, open [the workflow](https://github.com/nakiner/cnpg-connect-plugin/actions/workflows/release.yaml), choose **Run workflow**, and select that tag in the branch/tag selector. The workflow, source, Dockerfile, chart and scripts all come from the selected tag. A branch run does not publish. There is no separate tag input and no rebuilding old source with newer packaging scripts.
 
-Use a new version for changed source already distributed to users. A rerun republishes that version and does not enforce registry immutability. Image and chart publication is not atomic; a failed run may leave only one artifact available.
+Existing releases, drafts, image tags and chart versions are rejected. If a run fails before reserving a draft or publishing anything, the same tag can be retried after fixing the cause. Once the draft reservation exists, use a new version; do not delete the draft or retag to bypass the guard. Image and chart publication is not atomic, so failed runs may leave partial artifacts. See [immutable publication and failures](releases.md#existing-versions-and-partial-failures) for the full contract and GHCR's concurrency limits.
 
 ## Registry access
 

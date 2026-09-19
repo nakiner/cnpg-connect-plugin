@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 var errObservationSuperseded = errors.New("observation superseded by metadata")
@@ -24,6 +25,7 @@ func (o *Observer) configureProbeLimits() {
 }
 
 func (o *Observer) startWorkers(ctx context.Context, workers *sync.WaitGroup) {
+	o.startCAWorkers(ctx, workers)
 	reserved := reservedCapacity(o.opts.MaxConcurrentClusters)
 	for i := range o.opts.MaxConcurrentClusters {
 		urgentOnly := i < reserved
@@ -121,29 +123,46 @@ func (o *Observer) needsObservation(key clusterKey) bool {
 	return exists
 }
 
-func (o *Observer) acquireProbe(ctx context.Context, urgent bool) (func(), error) {
+func (o *Observer) acquireProbe(ctx context.Context, urgent bool) (release func(), resultErr error) {
+	started := time.Now()
+	defer o.probeQueueDuration.UpdateDuration(started)
+	defer func() {
+		if resultErr != nil {
+			o.probeCancellations.Add(1)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if !urgent {
 		select {
 		case o.backgroundProbeSlots <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		default:
+			o.probeSaturation.Add(1)
+			select {
+			case o.backgroundProbeSlots <- struct{}{}:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 	}
 	select {
 	case o.probeSlots <- struct{}{}:
-		return func() {
-			<-o.probeSlots
+	default:
+		o.probeSaturation.Add(1)
+		select {
+		case o.probeSlots <- struct{}{}:
+		case <-ctx.Done():
 			if !urgent {
 				<-o.backgroundProbeSlots
 			}
-		}, nil
-	case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return func() {
+		<-o.probeSlots
 		if !urgent {
 			<-o.backgroundProbeSlots
 		}
-		return nil, ctx.Err()
-	}
+	}, nil
 }

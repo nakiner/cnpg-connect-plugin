@@ -1,0 +1,65 @@
+name: Isolated CNPG lifecycle
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      peer_ref:
+        description: Exact counterpart commit for paired qualification (defaults to main)
+        default: main
+        type: string
+      repetitions:
+        description: Client lifecycle repetitions (1-20)
+        default: '1'
+        type: string
+  schedule:
+    - cron: '15 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REPETITIONS: ${{ inputs.repetitions || '1' }}
+    steps:
+      # Dispatch inputs are data, never interpolated into shell code.
+      - uses: actions/checkout@v7
+        with:
+          path: plugin
+      - uses: actions/checkout@v7
+        with:
+          repository: nakiner/cnpgconnect-go
+          ref: ${{ inputs.peer_ref || 'main' }}
+          path: client
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: plugin/go.mod
+          cache-dependency-path: |
+            plugin/go.sum
+            client/go.sum
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.0
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.2.4
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.33.0
+      - name: Exercise real plugin and client; reject skipped tests
+        working-directory: plugin
+        run: scripts/run-isolated.sh "$GITHUB_WORKSPACE/client" work/isolated-results "$REPETITIONS"
+      - name: Preserve measurements and logs (never kubeconfig or Secrets)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: isolated-cnpg-evidence
+          path: plugin/work/isolated-results/
+          if-no-files-found: error
+          retention-days: 14

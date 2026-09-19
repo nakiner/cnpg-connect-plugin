@@ -2,15 +2,23 @@ GO ?= go
 HELM ?= helm
 BUF ?= buf
 TOOLS_DIR ?= $(CURDIR)/work/bin
+GOVULNCHECK_VERSION := v1.8.0
 IMAGE ?= cnpg-connect-plugin:0.1.0-dev
 
-.PHONY: build test race vet fmt check-fmt chart-check check image generate
+.PHONY: build test race vet fmt check-fmt chart-check check image generate vuln
 build:
 	mkdir -p bin
 	$(GO) build -trimpath -o bin/cnpg-connect-plugin ./cmd/cnpg-connect-plugin
 
 test:
 	$(GO) test ./...
+
+# Scan both source reachability and the actual executable produced by build.
+vuln: build
+	mkdir -p $(TOOLS_DIR)
+	GOBIN=$(abspath $(TOOLS_DIR)) $(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	$(TOOLS_DIR)/govulncheck ./...
+	$(TOOLS_DIR)/govulncheck -mode=binary bin/cnpg-connect-plugin
 
 race:
 	$(GO) test -race ./...
@@ -25,18 +33,7 @@ check-fmt:
 	@test -z "$$(gofmt -l api internal cmd test)" || { gofmt -l api internal cmd test; exit 1; }
 
 chart-check:
-	$(HELM) lint chart
-	$(HELM) template connect chart --namespace cnpg-system > /dev/null
-	$(HELM) template connect chart --namespace cnpg-system -f examples/values-external.yaml > /dev/null
-	$(HELM) template connect chart --namespace cnpg-system -f examples/values-existing-secrets.yaml > /dev/null
-	$(HELM) template connect chart --namespace cnpg-system -f examples/values-large.yaml > /dev/null
-	$(HELM) template connect chart --namespace cnpg-system --set observer.pollInterval=100ms --set resources.requests.cpu=2 --set resources.limits.cpu=2 > /dev/null
-	$(HELM) template connect chart --namespace cnpg-system --set observer.kubeAPIQPS=50 --set observer.kubeAPIBurst=100 > /dev/null
-	@if $(HELM) template connect chart --set tls.certManager.enabled=false >/dev/null 2>&1; then echo "Missing TLS Secrets must fail validation"; exit 1; fi
-	$(HELM) template connect chart --set application.auth.existingSecret=legacy-discovery-token > /dev/null
-	$(HELM) template connect chart --set tls.application.enabled=false > /dev/null
-	@if $(HELM) template connect chart --set observer.kubeAPIQPS=0 >/dev/null 2>&1; then echo "Zero API QPS must fail validation"; exit 1; fi
-	@if $(HELM) template connect chart --set observer.kubeAPIBurst=0 >/dev/null 2>&1; then echo "Zero API burst must fail validation"; exit 1; fi
+	scripts/check-chart.sh
 
 check: check-fmt vet test chart-check
 

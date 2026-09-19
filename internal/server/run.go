@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/netutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
@@ -27,17 +29,25 @@ type Observer interface {
 }
 
 type Options struct {
-	PluginAddress    string
-	DiscoveryAddress string
-	HealthAddress    string
-	PluginTLS        *tls.Config
-	DiscoveryTLS     *tls.Config
-	Version          string
+	PluginAddress      string
+	DiscoveryAddress   string
+	HealthAddress      string
+	PluginTLS          *tls.Config
+	DiscoveryTLS       *tls.Config
+	Version            string
+	Limits             Limits
+	AuthorizeDiscovery func(context.Context) error
 }
 
 // Run starts all listeners before the observer. Any server or observer failure
 // shuts the whole process down; startup cannot leave a partially live plugin.
 func Run(ctx context.Context, options Options, observer Observer, registerDiscovery func(*grpc.Server), logger *slog.Logger) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	admission, err := newAdmission(runCtx, options.Limits, options.AuthorizeDiscovery)
+	if err != nil {
+		return err
+	}
 	pluginListener, err := net.Listen("tcp", options.PluginAddress)
 	if err != nil {
 		return fmt.Errorf("listen for CNPG-I: %w", err)
@@ -47,6 +57,10 @@ func Run(ctx context.Context, options Options, observer Observer, registerDiscov
 	if err != nil {
 		return fmt.Errorf("listen for discovery API: %w", err)
 	}
+	// Bound accepted sockets before TLS or HTTP/2 handshakes allocate state.
+	// Excess connections remain in the kernel backlog, not Go goroutines.
+	discoveryListener = netutil.LimitListener(discoveryListener, admission.limits.MaxConnections)
+	discoveryListener = admission.trackConnections(discoveryListener)
 	defer discoveryListener.Close()
 	healthListener, err := net.Listen("tcp", options.HealthAddress)
 	if err != nil {
@@ -54,14 +68,20 @@ func Run(ctx context.Context, options Options, observer Observer, registerDiscov
 	}
 	defer healthListener.Close()
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	pluginServer := grpc.NewServer(grpcOptions(runCtx, options.PluginTLS)...)
 	plugin.Register(pluginServer, options.Version, observer)
-	discoveryServer := grpc.NewServer(grpcOptions(runCtx, options.DiscoveryTLS)...)
+	// Discovery's HTTP handler already owns cancellation, size limits and
+	// connection lifetime. Native transport options apply only to CNPG-I.
+	discoveryServer := grpc.NewServer(admission.options()...)
 	registerDiscovery(discoveryServer)
+	discoveryHTTP := discoveryHTTPServer(admission, discoveryServer, options.DiscoveryTLS)
 	healthServer := &http.Server{
-		Handler:           HealthHandler(observer.Ready),
+		Handler: HealthHandler(observer.Ready, func(w io.Writer) {
+			admission.WriteMetrics(w)
+			if metrics, ok := observer.(interface{ WriteMetrics(io.Writer) }); ok {
+				metrics.WriteMetrics(w)
+			}
+		}),
 		ReadHeaderTimeout: 3 * time.Second,
 		WriteTimeout:      3 * time.Second,
 		IdleTimeout:       30 * time.Second,
@@ -88,7 +108,12 @@ func Run(ctx context.Context, options Options, observer Observer, registerDiscov
 		})
 	}
 	start("CNPG-I server", func() error { return pluginServer.Serve(pluginListener) })
-	start("discovery API", func() error { return discoveryServer.Serve(discoveryListener) })
+	start("discovery API", func() error {
+		if options.DiscoveryTLS != nil {
+			return discoveryHTTP.ServeTLS(discoveryListener, "", "")
+		}
+		return discoveryHTTP.Serve(discoveryListener)
+	})
 	start("health server", func() error { return healthServer.Serve(healthListener) })
 	start("observer", func() error {
 		defer close(observerDone)
@@ -109,6 +134,11 @@ func Run(ctx context.Context, options Options, observer Observer, registerDiscov
 	shutdown.Go(func() {
 		if err := healthServer.Shutdown(shutdownCtx); err != nil {
 			_ = healthServer.Close()
+		}
+	})
+	shutdown.Go(func() {
+		if err := discoveryHTTP.Shutdown(shutdownCtx); err != nil {
+			_ = discoveryHTTP.Close()
 		}
 	})
 	for _, srv := range []*grpc.Server{pluginServer, discoveryServer} {
@@ -190,8 +220,17 @@ type shutdownStream struct {
 
 func (s *shutdownStream) Context() context.Context { return s.ctx }
 
-func HealthHandler(ready func() bool) http.Handler {
+func HealthHandler(ready func() bool, metrics ...func(io.Writer)) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Err() != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		for _, write := range metrics {
+			write(w)
+		}
+	})
 	live := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))

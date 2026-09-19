@@ -2,7 +2,7 @@
 
 These opt-in tests use a real CNPG 1.30 deployment and PostgreSQL instances. They connect over verified TLS, verify CNPG plugin registration, observe async-to-sync membership changes, request a planned switchover through CNPG's status API, and reconnect to the complete topology stream. Optional standby replacement verifies identity changes even when the Pod name stays the same.
 
-The only supported Kubernetes context is **`kind-cnpg-connect-test`**. Tests require an explicit kubeconfig and recheck that context before every mutation. Mutations are limited to Cluster `databases/app-db`, its owned Pods, and (for the separately enabled outage test) Deployment `cnpg-system/connect`, with resource UID checks. The lifecycle test restores the original synchronous replication policy at the end; a promoted primary remains promoted.
+The only supported Kubernetes context is **`kind-cnpg-connect-test`**. Tests require an explicit kubeconfig and recheck that context before every mutation. Mutations are limited to Cluster `databases/app-db`, its owned Pods, and (for separately enabled tests) Deployment `cnpg-system/connect`, its application Certificate, and the database's public CA bundle, with resource UID checks. The lifecycle test restores the original synchronous replication policy at the end; a promoted primary remains promoted.
 
 Prepare these fixtures before running:
 
@@ -50,3 +50,53 @@ go test -tags=e2e -count=1 -timeout=2m -run '^TestLiveTopologySmoke$' -v ./test/
 ```
 
 `TestLiveTopologySmoke` performs verified TLS `GetTopology` and `WatchTopology` requests (with bearer metadata only when configured), verifies a healthy three-member snapshot and consistent Cluster/primary identity, and works with automatic observation or native enrollment. It does not mutate Kubernetes resources or require native plugin registration.
+
+## Run the complete isolated flow
+
+Prerequisites: Docker, kind, kubectl, Helm, jq, OpenSSL and Go matching `go.mod`.
+Install kind with `go install sigs.k8s.io/kind@v0.33.0`, then run from this checkout:
+
+```sh
+scripts/run-isolated.sh /absolute/path/to/cnpgconnect-go work/isolated-results 3
+```
+
+Arguments are the client checkout, a **new** output directory, and the number of
+client lifecycle repetitions (default 1, maximum 20). The runner builds the local
+plugin and uses a temporary Go workspace to test both local modules together.
+Keep both source trees stable while it runs.
+
+The runner refuses an existing `kind-cnpg-connect-test` cluster. It creates a
+private kubeconfig, installs cert-manager and CNPG 1.30, and deploys two plugin
+replicas plus three PostgreSQL instances. All Kubernetes commands use that
+explicit isolated context. Ports 7443 and 7541–7543 on loopback must be free.
+A unique bind mount marks the owned kind node; cleanup deletes that node by
+container ID even on a failed run or SIGTERM. An unrelated or replacement node
+is never deleted. SIGKILL or a host crash can prevent cleanup; inspect the local
+fixture before removing anything manually. Do not run two copies concurrently.
+
+The pinned PostgreSQL image is pulled normally. For an existing image cache,
+`POSTGRES_ARCHIVE=/absolute/path/postgres.tar` loads a standard Docker or OCI
+image archive with `kind load image-archive`; the archive must contain the exact
+reference in [the fixture](../../scripts/fixtures.yaml). Archive creation and
+registry transport are outside this runner.
+
+All assertions live in the Go suites. They cover native enrollment, sync/async
+membership, standby replacement, switchover, certificate renewal on every plugin
+replica, a CA Secret bundle update with unchanged Cluster certificate metadata,
+failover while discovery is absent, repeated client promotion and
+primary deletion, discovery outage, and an open TCP connection that stops
+forwarding data. Existing pgx, SQL and prepared SQL handles must recover.
+The runner rejects skipped or missing selected tests and reads metrics from
+both plugin replicas.
+
+`CNPGCONNECT_GO_E2E_RECOVERY_SLO=60s` is the default per-transition bound. It
+measures action-start to successful queries, including PostgreSQL recovery; it
+is not a discovery-only latency claim. The output directory contains ordinary
+Go test JSON logs with individual recovery measurements, metrics, Pod/event
+diagnostics, and a `result` file. Only `passed` means every selected suite and
+cleanup completed. Kubeconfigs, Secrets and credentials remain temporary.
+Three repetitions are smoke evidence; they do not establish a production p99.
+
+Both repositories run this same script from `integration.yaml` on pull requests,
+weekly and on manual dispatch. Their `peer_ref` input selects the other module's
+revision; use matching commits when qualifying changes before publication.

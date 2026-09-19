@@ -1,10 +1,10 @@
 # Performance
 
-The live switchover and original fleet results below describe plugin **0.0.5**, released on September 18, 2026. The scalability changes in the next section describe **unreleased source after 0.0.5**. Component tests and live measurements cover different parts of the system; neither is a production latency guarantee.
+The live switchover and original fleet results below describe plugin **0.0.5**, released on September 18, 2026. The scalability changes in the next section describe **unreleased source after 0.0.5**. Component tests and live measurements cover different parts of the system; neither is a production latency guarantee. The current source requires Go 1.27.1. Historical measurements below retain the toolchain and transport used at the time.
 
 ## How work scales
 
-The plugin maintains shared Kubernetes Cluster and Pod watches. Relevant events enqueue only the affected Cluster; repeated events coalesce. Status collection runs for Clusters with active discovery consumers, and subscribers to the same Cluster share that collection within one plugin replica. Additional replicas observe independently, so they can duplicate status work.
+The plugin maintains shared Kubernetes Cluster, Pod, and Secret metadata watches. Relevant events enqueue only affected Clusters; repeated events coalesce. CA material is shared by referenced Secret and refreshed on Secret changes, without periodic CA reads. Status collection runs for Clusters with active discovery consumers, and subscribers to the same Cluster share that collection within one plugin replica. Additional replicas observe independently, so they can duplicate status work.
 
 The default limits are 32 concurrent Cluster observations and 128 instance probes. Four workers and 16 probe slots are reserved for urgent work, within those totals. A primary or routing change cancels obsolete observations and queues a replacement immediately. Unrelated slow background checks cannot occupy the reserved capacity; a slow instance in the affected Cluster can still delay its own verification.
 
@@ -14,13 +14,113 @@ Kubernetes events do not carry every PostgreSQL replication-state change. The pl
 
 The current source addresses startup bursts, failed-primary observations, and large numbers of application streams:
 
-- **Cold CA reads:** default Kubernetes request limits increase from 20 QPS / 40 burst to 100 / 200. Overlapping reads with identical namespace, Secret name, and certificate metadata share one request. Each Cluster retains its own cache lifetime and cancellation; no Secret list/watch or extra RBAC is needed. A metadata change cannot join a read for the previous certificate view.
+- **CA reads:** default Kubernetes request limits increase from 20 QPS / 40 burst to 100 / 200. Clusters share a cache keyed by CA Secret identity and resource version. Secret metadata watches invalidate changed/deleted entries, and active consumers trigger a fetch. This replaces timed per-Cluster CA refreshes and requires Secret `list/watch` permissions as well as `get`.
 - **Failed primaries:** when the expected primary cannot be verified, remaining instance probes are canceled and the unavailable result is published without waiting for slow standbys. A healthy primary still requires the existing replica/conflicting-primary checks. Unrelated databases retain the existing reserved urgent capacity.
 - **TLS status clients:** cached transports support concurrent lookups. Parsing new trust material and closing retired idle connections happen outside the global cache lock. CA rotation still changes the trust used for new probes and never disables verification.
-- **Stream fan-out:** all gRPC watchers of an observation share an immutable snapshot and a lazily built protobuf. Mailboxes hold one pending update, and publication order prevents delayed delivery from restoring an older state. Subscriber payload copying and delivery happen outside the store lock; direct Go `Store.Subscribe` callers still receive independent copies. gRPC servers also share write buffers between idle connections.
+- **Stream fan-out:** all gRPC watchers of an observation share an immutable snapshot and a lazily built protobuf. Mailboxes hold one pending update, and publication order prevents delayed delivery from restoring an older state. Subscriber payload copying and delivery happen outside the store lock; direct Go `Store.Subscribe` callers still receive independent copies. The measured native gRPC transport shared write buffers between idle connections. Current discovery admission uses the standard library HTTP/2 server; those transport timings must be remeasured for the current server.
 - **Matching Go client:** unreleased `cnpgconnect-go` raises its default startup wait to 30 seconds, honors earlier caller deadlines, retains exponential jitter when streams repeatedly send a snapshot and close, and uses a freshness deadline timer instead of a 100 ms expiry ticker. Public configuration and protobuf APIs are unchanged. SQL operations are not replayed.
 
-Regression tests cover certificate rotation, independent cancellation of shared reads, transport cleanup during active requests, snapshot expiry and delete/recreate ordering, competing publications, and a client stalled by real HTTP/2 flow control. A slow stream cannot block unrelated clients, and disconnecting it releases its subscription.
+Regression tests cover certificate rotation, shared CA reads and late results, transport cleanup during active requests, snapshot expiry and delete/recreate ordering, competing publications, and a client stalled by real HTTP/2 flow control. A slow stream cannot block unrelated clients, and disconnecting it releases its subscription.
+
+### Current admission and recovery behavior
+
+The production discovery listener performs authorization and capacity admission at
+an HTTP/2 handler boundary, before gRPC creates a client-supplied deadline or
+reads a request body. Both plaintext and TLS clients still use the ordinary gRPC
+API. This avoids retained deadline timers on native gRPC tap rejection. Initial
+request timeouts close incomplete bodies; completed watches retain no initial
+message timeout. Accepted sockets, HTTP/2 streams, active RPCs, and watches each
+have their own bound. Connection shutdown, rejection, malformed messages and
+incomplete frames are covered by real-transport regression tests.
+
+Canceled RPCs get a 100 ms grace to flush terminal trailers, followed by a
+stream-scoped write deadline. A peer withholding its response window cannot
+retain an expired RPC's writer indefinitely. Plaintext and TLS regressions
+verify actual write/flush and handler termination, a stream reset, and continued
+unary calls and watch updates on the same connection.
+
+The default per-replica limits are 1,024 sockets, 4,096 RPCs, 2,048 watches, and
+128 concurrent streams per connection. Raise the matching `application.limits`
+values only with measurements of your actual client connection and subscription
+patterns. The 6,000-Cluster component workload below bypasses those limits; it
+is observer/fan-out evidence rather than qualification of 6,000 production
+application connections. See [production configuration](production.md).
+
+Primary conflict evidence now records an actual inconsistent primary observation,
+not merely the history of a once-healthy primary. A completed CNPG failover can
+recover while the former primary is unreachable. Actual conflicts survive
+metadata changes, failed probes, deletion and removal of temporary fencing until
+verified demotion or replacement resolves them. The matching Go client accepts
+explicit member withdrawals from older same-incarnation snapshots without
+rolling back healthy routes or extending their TTL, and a silent reconnected
+stream is retried when the cached usable topology expires.
+
+The matching client also retries transient connection-establishment failures
+during `Open`, within its existing startup deadline. Authentication, certificate
+and application-hook errors remain terminal. This does not replay application
+queries or transactions.
+
+### Secret-watch and pgx qualification, September 19, 2026
+
+After adopting Secret metadata watches, shared CA caching, VictoriaMetrics
+histograms and native pgx connection retirement, the paired runner passed eight
+suites with no failures or skips. It used Kubernetes 1.34.0, CNPG 1.30.0,
+PostgreSQL 18.4, two plugin replicas and three database instances, with Go 1.27.1.
+The disposable cluster was removed after completion.
+
+| Event | Samples | Observed range |
+| --- | ---: | ---: |
+| CA Secret bundle update to existing gRPC stream | 1 | 38.3 ms |
+| Planned switchover to usable application handles | 3 | 4.150–5.084 s |
+| Primary Pod deletion to usable application handles | 3 | 8.231–25.111 s |
+| Discovery restart | 1 | 12.238 s |
+| Discovery traffic resumed after expiry | 1 | 60.1 ms |
+
+The [CA test](../test/e2e/ca_watch_test.go) changes public bundle bytes while
+retaining the existing root, verifies unchanged Cluster certificate metadata,
+and restores the Secret. This measures event delivery for a bundle update.
+The application recovery samples include PostgreSQL/CNPG processing and retain
+the original pgx, SQL and prepared-statement handles. They are smoke samples,
+not percentiles or a production latency guarantee.
+
+The updated cold-start test made exactly one GET for 500 Clusters sharing one
+CA, 500 GETs for 500 distinct CAs and 1,000 GETs for 1,000 distinct CAs. The
+6,000-Cluster warm test also passed. These synthetic runs used the development
+host; they are not directly comparable to the earlier two-CPU measurements.
+
+### Earlier paired recovery qualification, September 19, 2026
+
+Before the Secret-watch and pgx Reset changes, the September 19 plugin and client candidate passed eight suites in a disposable
+kind cluster with Kubernetes 1.34.0, unmodified CNPG 1.30.0, PostgreSQL 18.4,
+two plugin replicas, and a three-instance database. Both used Go 1.27.1. The
+shell runner completed all eight Go suites with no skips or failures, collected
+metrics from both plugin replicas, and removed its owned cluster. Runtime source
+was held unchanged during the run. This candidate includes the canceled-response
+write-deadline fix; focused HTTP/2 regressions also passed under race detection.
+
+Coverage included three client lifecycle repetitions, each with a planned
+switchover and primary Pod deletion, certificate renewal, plugin/discovery
+outages, and a discovery stall that kept TCP sockets open. Native pgx,
+`database/sql`, and prepared-statement handles recovered without replacement.
+The stall test also verified that expired discovery stopped managed connections
+while a direct PostgreSQL connection remained healthy.
+
+| Recovery event | Samples | Observed range |
+| --- | ---: | ---: |
+| Planned switchover | 3 | 3.134–5.036 s |
+| Primary Pod deletion | 3 | 20.252–24.346 s |
+| Discovery restart | 1 | 9.252 s |
+| Discovery traffic resumed after expiry | 1 | 44.1 ms |
+
+Switchover and deletion timings start before the corresponding Kubernetes
+operation and end when all three application handles report the new writable
+primary. They include CNPG recovery, local forwarding, and probe deadlines;
+they do not isolate plugin latency and are not directly comparable to the
+PostgreSQL-ready intervals below. The stall recovery timing starts when traffic
+resumes, after the test has already observed expiry. These small samples are
+regression evidence, not production percentiles or fleet-capacity measurements.
+See the [isolated runner instructions](../test/e2e/README.md) to run the paired
+qualification against the source you intend to publish.
 
 ### Cold startup and independent TLS clients
 
@@ -33,7 +133,7 @@ Measured September 18, 2026, from unreleased source in native Linux/arm64 contai
 | 500 databases, shared CA and identical certificate metadata | 0.433 s | 0.815 s | **0.863 s** | 18 overlapping CA-read batches |
 | 500 independent TLS clients, 30 publications to every client | 2.990 ms | **5.832 ms** | 8.823 ms | p99 7.730 ms; 15,000 receipts |
 
-The [cold-start test](../internal/observer/cold_start_test.go) uses the real Kubernetes REST client and its 100 QPS / 200 burst limiter against a loopback HTTP API. CA responses and simulated instance responses each take 20 ms. It starts from empty CA caches with already-synchronized metadata, using 32 Cluster workers and 128 probes; readiness is observed through local Store subscriptions. Peak concurrent CA requests were 28 for distinct Secrets and one for the shared case. It excludes informer initialization, real Kubernetes server load, status TLS, application gRPC, and database connection setup. Sharing a CA does not imply sharing all CNPG certificate metadata, so the shared case is an explicit workload, not the default assumption.
+These cold-start measurements predate the Secret metadata watch and shared persistent CA cache. The [cold-start test](../internal/observer/cold_start_test.go) used the real Kubernetes REST client and its 100 QPS / 200 burst limiter against a loopback HTTP API. CA responses and simulated instance responses each took 20 ms. It started from empty CA caches with already-synchronized metadata, using 32 Cluster workers and 128 probes; readiness was observed through local Store subscriptions. Peak concurrent CA requests were 28 for distinct Secrets and one for the shared case. It excluded informer initialization, real Kubernetes server load, status TLS, application gRPC, and database connection setup. The shared case required identical Cluster certificate metadata in that earlier implementation; current sharing is by Secret identity/version.
 
 The [TLS client test](../internal/discovery/tls_load_test.go) gives each client its own loopback TCP connection, verified TLS 1.3 session, HTTP/2 transport, and gRPC stream. Every client receives each publication before the next round begins. Timing starts before `Store.Put` and ends after the client decodes its protobuf; it excludes metadata observation and SQL. Store publication p95 was 0.250 ms. Initial connections were established sequentially in 304 ms; this does not measure simultaneous TLS handshakes. Server and test clients share the same container and CPU quota. Certificates are held in memory in this transport test; production mounted-credential reloading is covered separately by server tests. The regression suite also exercises a concurrent 32-client reconnect wave and cancellation under actual flow-control backpressure.
 
@@ -57,7 +157,7 @@ The original 6,000-Cluster warm fleet test was also repeated under the same two-
 | Timed-out background; changed Clusters healthy | `5s` | 25.1 ms | 26.0 ms | 26.2 ms | No samples |
 | Timed-out background; changed Clusters healthy | `100ms` | 24.6 ms | 25.7 ms | 25.9 ms | No samples |
 
-This retains the earlier test's boundaries: fake status responses, warm caches, one in-memory gRPC transport, and 100 injected changes per scenario. The new work reduces cold-start and high-fan-out costs; it does not materially shorten the already fast warm event path or guarantee a 50 ms maximum.
+This retains the earlier test's boundaries: fake status responses, warm caches, one in-memory gRPC transport, and 100 injected changes per scenario. The harness creates a bare gRPC server, bypassing production admission. Its 6,000 streams exceed current defaults of 128 streams per connection, 2,048 watch RPCs and 1,024 accepted connections per replica; it does not demonstrate that capacity with installation defaults. The new work reduces cold-start and high-fan-out costs; it does not materially shorten the already fast warm event path or guarantee a 50 ms maximum.
 
 ## Live switchover results
 
@@ -123,24 +223,24 @@ This test excludes cold CA lookup, informer initialization, Kubernetes watch del
 
 ### Reproduce the component test
 
-From the plugin repository with Go 1.26.4, run:
+From the current plugin repository with Go 1.27.1, run the same component workloads below. New results describe the current code and are not reproductions of the historical toolchain. To reproduce a historical release, use its corresponding source and toolchain together:
 
 ```sh
-GOWORK=off GOTOOLCHAIN=go1.26.4 go test -count=1 -tags=loadtest \
+GOWORK=off GOTOOLCHAIN=go1.27.1 go test -count=1 -tags=loadtest \
   -run '^TestFleetLoad$' -v ./internal/observer
 
-CNPG_LOAD_SLOW_BACKGROUND=1 GOWORK=off GOTOOLCHAIN=go1.26.4 \
+CNPG_LOAD_SLOW_BACKGROUND=1 GOWORK=off GOTOOLCHAIN=go1.27.1 \
   go test -count=1 -tags=loadtest -run '^TestFleetLoad$' -v ./internal/observer
 ```
 
 Run the additional component workloads with:
 
 ```sh
-GOWORK=off GOTOOLCHAIN=go1.26.4 go test -count=1 -tags=loadtest \
+GOWORK=off GOTOOLCHAIN=go1.27.1 go test -count=1 -tags=loadtest \
   -run '^TestColdStartFleet$' -v ./internal/observer
-CNPG_STREAM_CLIENTS=500 GOWORK=off GOTOOLCHAIN=go1.26.4 \
+CNPG_STREAM_CLIENTS=500 GOWORK=off GOTOOLCHAIN=go1.27.1 \
   go test -count=1 -tags=loadtest -run '^TestTLSClientLoad$' -v ./internal/discovery
-GOWORK=off GOTOOLCHAIN=go1.26.4 go test -run '^$' \
+GOWORK=off GOTOOLCHAIN=go1.27.1 go test -run '^$' \
   -bench '^BenchmarkStoreFanout$' -benchmem -benchtime=300ms ./internal/discovery
 ```
 
@@ -148,9 +248,9 @@ The fleet tests use fake Kubernetes clients; cold-start tests use a loopback API
 
 ```sh
 bench_dir="$(mktemp -d)"
-GOWORK=off GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+GOWORK=off GOTOOLCHAIN=go1.27.1 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
   go test -c -tags=loadtest -o "$bench_dir/observer.test" ./internal/observer
-GOWORK=off GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+GOWORK=off GOTOOLCHAIN=go1.27.1 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
   go test -c -tags=loadtest -o "$bench_dir/discovery.test" ./internal/discovery
 
 cat > "$bench_dir/Dockerfile" <<'EOF'

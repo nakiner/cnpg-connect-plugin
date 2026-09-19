@@ -5,56 +5,38 @@ on:
 permissions:
   contents: read
 jobs:
-  go:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
-          cache: true
-      - run: make check-fmt vet test race build
-      - name: Compile integration tests without running them
-        run: go test -tags=e2e -run '^$' ./test/e2e
-  chart:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
         with:
-          version: v3.19.0
-      - run: make chart-check
-      - name: Check release packaging
-        env:
-          RELEASE_REPOSITORY: ${{ github.repository }}
-          RELEASE_COMMIT: ${{ github.sha }}
+          version: v4.2.4
+      - run: go install github.com/mikefarah/yq/v4@v4.47.2
+      - run: make check race vuln
+      - name: Compile integration tests
+        run: go test -tags=e2e -run '^$' ./test/e2e
+      - name: Validate shell scripts and workflows
         run: |
-          python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
-          python3 -m unittest discover -s scripts -p 'test_*.py'
-          python3 scripts/package_chart.py \
-            --source chart \
-            --version 0.0.0-ci \
-            --image "ghcr.io/${RELEASE_REPOSITORY,,}" \
-            --revision "$RELEASE_COMMIT" \
-            --source-url "https://github.com/${RELEASE_REPOSITORY}" \
-            --destination work/packages
+          shellcheck scripts/*.sh
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
   image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: docker build --build-arg VERSION=0.0.0-ci -t cnpg-connect-plugin:ci .
-      - name: Verify image version
-        run: test "$(docker run --rm cnpg-connect-plugin:ci --version)" = 0.0.0-ci
-  workflows:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Validate workflows with ShellCheck
+      - run: docker build --build-arg VERSION=0.0.0-ci -t cnpg-connect-plugin:ci .
+      - name: Scan the actual image binary
         run: |
-          shellcheck --version
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          container=$(docker create cnpg-connect-plugin:ci)
+          trap 'docker rm "$container"' EXIT
+          docker cp "$container:/cnpg-connect-plugin" ./image-binary
+          govulncheck -mode=binary ./image-binary
+      - name: Verify image version
+        run: test "$(docker run --rm cnpg-connect-plugin:ci --version)" = 0.0.0-ci

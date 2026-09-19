@@ -3,7 +3,6 @@ package observer
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,7 +11,6 @@ import (
 	v1 "github.com/nakiner/cnpg-connect-plugin/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // Exercises the real queue, workers, topology validation and Store fanout, with
@@ -25,30 +23,13 @@ func TestScaleActiveClustersAndSubscribers(t *testing.T) {
 	o.configureProbeLimits()
 	o.opts.PollInterval = time.Hour // one deterministic refresh round
 	o.opts.TTL = 2 * time.Hour
-	template, _ := o.cluster(clusterKey{"test", "db"})
-	_, pods, _ := fixture()
 	var streams []<-chan v1.Snapshot
 	var stalled []<-chan v1.Snapshot
 	var unsubscribe []func()
 	for i := range clusters {
 		name := fmt.Sprintf("scale-%04d", i)
-		c := template.DeepCopy()
-		c.SetName(name)
-		c.SetUID(types.UID(name))
-		_ = unstructured.SetNestedField(c.Object, name+"-1", "status", "currentPrimary")
-		_ = unstructured.SetNestedField(c.Object, name+"-1", "status", "targetPrimary")
-		_ = o.clusterInformer.GetIndexer().Add(c)
+		c, _, _ := addFleetCluster(t, o, name, "db-ca")
 		o.clusterEvent(nil, c)
-		for j := range pods {
-			p := pods[j].DeepCopy()
-			p.Name = fmt.Sprintf("%s-%d", name, j+1)
-			p.UID = types.UID(p.Name)
-			p.Labels["cnpg.io/cluster"] = name
-			p.OwnerReferences[0].Name = name
-			p.OwnerReferences[0].UID = types.UID(name)
-			_ = o.podInformer.GetIndexer().Add(p)
-		}
-		o.connections.Store(clusterKey{"test", name}, cachedConnection{parameters: v1.ConnectionParameters{Database: "app", ServerCAPEM: []byte("cached-public-CA")}, uid: string(c.GetUID()), secret: "db-ca", certificates: `{"serverCASecret":"db-ca"}`, refreshed: time.Now()})
 		for j := range servicesPerCluster {
 			stream, cancel := o.store.Subscribe("test", name)
 			unsubscribe = append(unsubscribe, cancel)
@@ -90,17 +71,7 @@ func TestScaleActiveClustersAndSubscribers(t *testing.T) {
 		if p.OwnerReferences[0].Name == changedName && promoted.Load() {
 			primarySuffix = "-2"
 		}
-		primary := strings.HasSuffix(p.Name, primarySuffix)
-		s := instanceStatus{IsPrimary: &primary, SystemID: "scale", Timeline: 1, WalReceiverActive: !primary}
-		if primary {
-			name := p.OwnerReferences[0].Name
-			for _, suffix := range []string{"-1", "-2", "-3"} {
-				if suffix != primarySuffix {
-					s.Replication = append(s.Replication, replicationStatus{ApplicationName: name + suffix, State: "streaming", SyncState: "sync"})
-				}
-			}
-		}
-		return s, nil
+		return fleetStatus(p, primarySuffix, "scale"), nil
 	}
 	kube.ClearActions()
 	dyn.ClearActions()
@@ -197,18 +168,15 @@ func TestObservationDeadlineIncludesWaitingForProbeCapacity(t *testing.T) {
 func TestUnusedTransportAndCAEntriesAreReclaimed(t *testing.T) {
 	o, _, _ := fakeObserver(t)
 	observe(t, o)
-	c, ok := o.connections.Load(clusterKey{"test", "db"})
-	if !ok {
-		t.Fatal("missing connection")
-	}
-	if _, err := o.statusClient(c.(cachedConnection).parameters, "db-rw.test.svc"); err != nil {
+	c := testConnection(t, o)
+	if _, err := o.statusClient(c.ConnectionParameters, "db-rw.test.svc"); err != nil {
 		t.Fatal(err)
 	}
 	o.pruneConnections(time.Now().Add(2 * time.Minute))
-	if _, ok := o.connections.Load(clusterKey{"test", "db"}); ok {
+	if len(o.cas) != 0 {
 		t.Fatal("idle CA retained")
 	}
-	if _, ok := o.statusClients.Load("db-rw.test.svc"); ok {
+	if o.statusClients["db-rw.test.svc"] != nil {
 		t.Fatal("idle TLS transport retained")
 	}
 }

@@ -249,7 +249,7 @@ type harness struct {
 	clusterUID types.UID
 }
 
-func newHarness(t *testing.T, ctx context.Context) *harness {
+func newHarness(t *testing.T, ctx context.Context, options ...grpc.DialOption) *harness {
 	t.Helper()
 	h := &harness{kubeconfig: os.Getenv("CNPG_CONNECT_E2E_KUBECONFIG")}
 	if err := h.guardContext(); err != nil {
@@ -292,9 +292,10 @@ func newHarness(t *testing.T, ctx context.Context) *harness {
 	if !roots.AppendCertsFromPEM(certificate.Data["ca.crt"]) {
 		t.Fatal("discovery CA Secret has no valid ca.crt")
 	}
-	connection, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+	options = append([]grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
 		MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: serverName,
-	})))
+	}))}, options...)
+	connection, err := grpc.NewClient(endpoint, options...)
 	if err != nil {
 		t.Fatal(err)
 	}

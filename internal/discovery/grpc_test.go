@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,6 +142,10 @@ func TestGRPCReferenceErrorsAndUnavailableSnapshot(t *testing.T) {
 	}{
 		{"database", "postgres", codes.NotFound}, {"", "postgres", codes.InvalidArgument},
 		{"database", "../postgres", codes.InvalidArgument}, {"database", "POSTGRES", codes.InvalidArgument},
+		{"database.extra", "postgres", codes.InvalidArgument}, {"-database", "postgres", codes.InvalidArgument},
+		{strings.Repeat("a", 64), "postgres", codes.InvalidArgument},
+		{"database", strings.Repeat("a", 64) + ".postgres", codes.InvalidArgument},
+		{"database", "postgres.extra", codes.NotFound},
 	} {
 		ctx := rpcContext(t)
 		_, err := client.GetTopology(ctx, &connectv1.GetTopologyRequest{Namespace: test.namespace, Name: test.name})
@@ -190,13 +195,24 @@ func TestGRPCWatchInitialRefreshDeletionRecreationAndCancellation(t *testing.T) 
 	}
 	input.ValidUntil = input.ValidUntil.Add(time.Second)
 	input.ObservedAt = input.ObservedAt.Add(time.Second)
+	input.Members[1].ReplayLSN = "0/20"
+	input.Members[0], input.Members[1] = input.Members[1], input.Members[0]
 	s.Put(input)
 	refreshed, err := stream.Recv()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if refreshed.Revision != initial.Revision || !refreshed.ValidUntil.AsTime().Equal(input.ValidUntil) {
-		t.Fatal("same-revision refresh lost freshness")
+		t.Fatal("freshness, WAL progress, or ordering changed routing revision or lost freshness")
+	}
+	if refreshed.Members[0].ReplayLsn != "0/20" {
+		t.Fatal("refresh lost WAL observation")
+	}
+	other := NewStore()
+	other.Put(input)
+	fromOther, _ := other.Get("database", "postgres")
+	if fromOther.Revision == initial.Revision {
+		t.Fatal("revision reused across process/store restart")
 	}
 	s.Expire(input.ValidUntil)
 	expired, err := stream.Recv()
@@ -211,8 +227,11 @@ func TestGRPCWatchInitialRefreshDeletionRecreationAndCancellation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted.Reason != "deleted" || len(deleted.Members) != 0 {
+	if deleted.Available || deleted.PrimaryId != "" || deleted.Reason != "deleted" || len(deleted.Members) != 0 || deleted.Revision == expired.Revision {
 		t.Fatal("watch lost deletion")
+	}
+	if _, err := client.GetTopology(ctx, &connectv1.GetTopologyRequest{Namespace: "database", Name: "postgres"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("deleted cluster is still discoverable: %v", err)
 	}
 	input.Cluster.UID = "new-cluster"
 	s.Put(input)
@@ -220,7 +239,7 @@ func TestGRPCWatchInitialRefreshDeletionRecreationAndCancellation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recreated.Cluster.Uid != "new-cluster" || !recreated.Available {
+	if recreated.Cluster.Uid != "new-cluster" || !recreated.Available || recreated.Revision == initial.Revision {
 		t.Fatal("watch lost recreation")
 	}
 	// Every reconnect starts with a full current snapshot.

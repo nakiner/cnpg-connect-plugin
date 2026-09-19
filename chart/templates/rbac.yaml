@@ -26,9 +26,9 @@ rules:
     resources: [pods]
     verbs: [get, list, watch]
   - apiGroups: [""]
-    # Only named PostgreSQL CA Secrets are fetched; no Secret list/watch.
+    # Watch metadata only; fetch public CA contents for referenced Secrets.
     resources: [secrets]
-    verbs: [get]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: {{ if .Values.watchNamespace }}RoleBinding{{ else }}ClusterRoleBinding{{ end }}
