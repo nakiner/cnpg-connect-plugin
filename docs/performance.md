@@ -1,6 +1,6 @@
 # Performance
 
-The live switchover and original fleet results below describe plugin **0.0.5**, released on September 18, 2026. The scalability changes in the next section describe **unreleased source after 0.0.5**. Component tests and live measurements cover different parts of the system; neither is a production latency guarantee. The current source requires Go 1.27.1. Historical measurements below retain the toolchain and transport used at the time.
+The live switchover and original fleet results below describe plugin **0.0.5**, released on September 18, 2026. Later sections record the source and settings used for each qualification run. Component tests and live measurements cover different parts of the system; neither is a production latency guarantee. Historical measurements retain the toolchain and transport used at the time.
 
 ## How work scales
 
@@ -13,6 +13,8 @@ Kubernetes events do not carry every PostgreSQL replication-state change. The pl
 ## Unreleased scalability changes
 
 The current source addresses startup bursts, failed-primary observations, and large numbers of application streams:
+
+- **Observer publication:** metadata validation and store commits remain atomic under the observer lock. Subscriber delivery and topology logging happen after unlocking. A slow log sink no longer holds the global observer lock; logging remains synchronous and can still occupy the calling worker or event handler. A shared-CA invalidation delivers all affected notifications before logging them. Monotonic subscriber ordering rejects late notifications after invalidation or deletion.
 
 - **CA reads:** default Kubernetes request limits increase from 20 QPS / 40 burst to 100 / 200. Clusters share a cache keyed by CA Secret identity and resource version. Secret metadata watches invalidate changed/deleted entries, and active consumers trigger a fetch. This replaces timed per-Cluster CA refreshes and requires Secret `list/watch` permissions as well as `get`.
 - **Failed primaries:** when the expected primary cannot be verified, remaining instance probes are canceled and the unavailable result is published without waiting for slow standbys. A healthy primary still requires the existing replica/conflicting-primary checks. Unrelated databases retain the existing reserved urgent capacity.
@@ -45,6 +47,108 @@ values only with measurements of your actual client connection and subscription
 patterns. The 6,000-Cluster component workload below bypasses those limits; it
 is observer/fan-out evidence rather than qualification of 6,000 production
 application connections. See [production configuration](production.md).
+
+### Production transport under sustained load, September 19, 2026
+
+[TestDiscoveryRecoveryLoad](../internal/server/load_test.go) exercises the actual
+admission handler, connection limit, HTTP/2 server, TLS and gRPC discovery API.
+The run used Go 1.27.1, gRPC 1.84.0, Linux/arm64, a two-CPU cgroup quota and a
+2 GiB memory limit. Go selected `GOMAXPROCS=2` without an environment override.
+
+- 2,000 independent TCP/TLS connections and watches, spread over 200 synthetic
+  database records, with five publications per second per record.
+- Three one-minute workload periods, separated by two complete discovery-server
+  stops. Each stop included 500 ms of deliberate downtime. The store retained
+  synthetic topology; real observer cold starts are measured separately.
+- Explicit admission capacity: 2,064 connections, 2,064 watches and 2,128 RPCs.
+  This is above the installation's default 1,024 connection limit.
+
+| Measurement | Result |
+| --- | ---: |
+| Delivered observations | 1,800,000 |
+| Delivery p50 / p95 / p99 bucket upper bounds | 37 / 57 / 93 ms |
+| Maximum observed delivery | 121.7 ms |
+| Initial connection of every client | 776.7 ms |
+| Stop to every client receiving fresh state, two restarts | 1.806 / 1.794 s |
+| Live Go heap after GC, three periods | 208.1 / 214.8 / 211.5 MiB |
+| Goroutines after each period | 24,003 / 24,003 / 24,003 |
+| Container memory peak | 715.2 MiB |
+| CPU throttling | 8 of 1,848 periods; 8.1 ms total |
+
+Delivery time starts immediately before each `Store.Put` and ends at client
+protobuf receipt. Histograms have bounded storage. Every client must receive the
+latest marker after each period/restart; topology regression and retained server
+admission after shutdown fail the test. Post-GC heap growth is also bounded, but
+three minutes cannot establish absence of small leaks.
+
+**Client and server run in the same container.** Memory, CPU and goroutine counts
+include all load generators and must not be treated as plugin-only resource
+requirements. The payload includes roughly 2 KiB of synthetic CA data. This test
+excludes Kubernetes watches, PostgreSQL status probes, application SQL pools and
+external network/LB delays; the library's live recovery soak covers real pools.
+
+To run a shorter host check, or compile it into the same resource-limited Linux
+container used for the component tests below:
+
+```sh
+CNPG_LOAD_CLIENTS=2000 CNPG_LOAD_DATABASES=200 CNPG_LOAD_SECONDS=180 \
+GOWORK=off go test -tags=loadtest -run '^TestDiscoveryRecoveryLoad$' \
+  -count=1 -timeout=6m -v ./internal/server
+```
+
+The host command alone does not enforce a CPU or memory limit. Configurable
+ranges are 1–10,000 clients, 1–client-count databases, and 6–1,800 seconds;
+larger values need matching file descriptor and resource budgets.
+
+### Many-pool recovery, September 19, 2026
+
+The paired runner passed all nine selected suites without skips or failures
+against Kubernetes 1.34.0, unmodified CNPG 1.30.0 and PostgreSQL 18.4. The fixture
+had two plugin replicas and three database instances. Runtime source stayed
+unchanged during the run; the disposable kind cluster was removed afterward.
+
+The new library soak retained 32 independent application pools (16 pgx and
+16 `database/sql`), with two connections and two query workers per pool. It
+warmed all 64 connections before injecting faults and completed five promotion /
+complete-discovery-outage cycles in 3m11s. The three-minute target finishes the
+last cycle rather than stopping midway through recovery.
+
+| Measurement | Result |
+| --- | ---: |
+| Promotion request to every worker querying the selected primary | 3.151–5.127 s, five samples |
+| Discovery scale-up to every worker querying again | 8.637–11.878 s, five samples |
+| Successful primary queries / total attempts | 68,939 / 70,140 |
+| Query errors during the fault-injection run | 1,201 |
+| Successful-query p50 / p95 / p99 bucket upper bounds | 8.192 / 16.384 / 262.144 ms |
+| All-attempt p99 bucket upper bound, including outage deadlines | 4,194.304 ms |
+| Sampled application connections on the current primary | Peak 64 across 465 samples |
+| Standby results observed by the primary workload | 0 |
+
+Each outage waited for every discovery Pod to stop and for topology to expire.
+Every pool then had to reject acquisition with its request deadline while a
+direct PostgreSQL connection still worked. Restoring discovery recovered the
+original handles. The test checked committed sentinel data throughout, never
+replayed workload queries, and verified zero application connections on the
+current primary after closing the pools.
+
+Recovery includes CNPG/PostgreSQL processing, Pod startup and client reconnect
+backoff; it is not plugin-only delivery latency. The connection peak is sampled
+on the current primary, not across all instances, and pgx may refill connections
+gradually after a pool reset. These are short local recovery measurements, not
+fleet-capacity or external-network guarantees. The existing suites separately
+cover prepared statements, primary Pod loss and a discovery stall with open TCP
+sockets. See the [runner instructions](../test/e2e/README.md) to repeat the soak;
+weekly CI enables it, and manual CI runs can opt in.
+
+### Slow replicas and primary safety
+
+A ready replica may reveal a previously unknown conflicting primary even after
+the expected primary has answered. Skipping a fenced replica also loses evidence
+needed if it is later unfenced while unreachable. The delayed-response regression
+in [slow_replica_test.go](../internal/observer/slow_replica_test.go) covers both.
+The observer therefore retains the bounded role checks before publication.
+Lowering `probeTimeout` trades earlier exclusion of slow instances against fewer
+successful observations; it is not a free latency improvement.
 
 Primary conflict evidence now records an actual inconsistent primary observation,
 not merely the history of a once-healthy primary. A completed CNPG failover can

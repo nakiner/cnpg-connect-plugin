@@ -97,6 +97,28 @@ diagnostics, and a `result` file. Only `passed` means every selected suite and
 cleanup completed. Kubeconfigs, Secrets and credentials remain temporary.
 Three repetitions are smoke evidence; they do not establish a production p99.
 
+To add sustained queries through independent pgx and SQL pools, repeated
+promotions, and complete discovery outages, enable the optional recovery soak:
+
+```sh
+CNPGCONNECT_GO_E2E_SOAK=1 \
+CNPGCONNECT_GO_E2E_SOAK_CLIENTS=32 \
+CNPGCONNECT_GO_E2E_SOAK_POOL_SIZE=2 \
+CNPGCONNECT_GO_E2E_SOAK_DURATION=3m \
+scripts/run-isolated.sh /absolute/path/to/cnpgconnect-go work/isolated-soak 3
+```
+
+The Go test checks the configured connection budget against PostgreSQL's limit
+and records sampled connection peaks, query latency and recovery of every pool.
+The same handles survive every transition. Duration covers the workload period;
+setup and the last complete fault cycle add time. This exercises application
+fan-out to one database, not thousands of real databases or production network
+partitions. See the client integration guide for the workload and bounds.
+
 Both repositories run this same script from `integration.yaml` on pull requests,
 weekly and on manual dispatch. Their `peer_ref` input selects the other module's
 revision; use matching commits when qualifying changes before publication.
+Weekly runs include the 32-pool, 64-session, three-minute recovery soak. Manual
+dispatch exposes a `soak` checkbox; pull-request runs retain the shorter suites.
+When selected, CI requires the soak's passing result explicitly, including when
+the counterpart checkout supplies the runner.

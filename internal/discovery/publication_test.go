@@ -64,6 +64,58 @@ func TestSubscriptionRejectsDelayedOlderPublication(t *testing.T) {
 	}
 }
 
+func TestDeferredDeliveryCannotRewindNewerCommit(t *testing.T) {
+	for _, operation := range []string{"put", "expiry", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			store := NewStore()
+			store.Put(sampleSnapshot())
+			updates, cancel := store.Subscribe("database", "postgres")
+			defer cancel()
+			<-updates
+			var deliver func()
+			switch operation {
+			case "put":
+				input := sampleSnapshot()
+				input.PrimaryID = "intermediate"
+				_, deliver = store.PutDeferred(input)
+				if got, _ := store.Get("database", "postgres"); got.PrimaryID != "intermediate" {
+					t.Fatal("deferred put did not commit before delivery")
+				}
+			case "expiry":
+				store.mu.Lock()
+				store.records[clusterKey{"database", "postgres"}].snapshot.ValidUntil = time.Now().Add(-time.Second)
+				store.mu.Unlock()
+				var expired v1.Snapshot
+				expired, _, deliver = store.GetDeferred("database", "postgres")
+				assertExpired(t, expired)
+			case "delete":
+				deliver = store.DeleteDeferred("database", "postgres")
+				if _, exists := store.Get("database", "postgres"); exists {
+					t.Fatal("deferred delete retained its record")
+				}
+			}
+			select {
+			case <-updates:
+				t.Fatal("commit delivered while its caller still held the producer lock")
+			default:
+			}
+			newest := sampleSnapshot()
+			newest.PrimaryID = "newest"
+			store.Put(newest)
+			deliver()
+			if got := latest(t, updates); got.PrimaryID != "newest" {
+				t.Fatalf("delayed %s rewound routing to %+v", operation, got)
+			}
+			deliver() // Repeated delivery is harmless too.
+			select {
+			case <-updates:
+				t.Fatal("older commit was redelivered after the latest snapshot")
+			default:
+			}
+		})
+	}
+}
+
 func TestDeliveryDoesNotHoldGlobalStoreLock(t *testing.T) {
 	store := NewStore()
 	input := sampleSnapshot()

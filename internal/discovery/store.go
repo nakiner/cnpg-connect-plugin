@@ -135,6 +135,15 @@ func (s *Store) ActiveClusters() []v1.ClusterRef {
 // Freshness timestamps must come from the actual observation, never a heartbeat.
 // The result reports whether routing changed; it avoids a separate Get for logging.
 func (s *Store) Put(snapshot v1.Snapshot) bool {
+	changed, deliver := s.PutDeferred(snapshot)
+	deliver()
+	return changed
+}
+
+// PutDeferred commits an observation and returns its subscriber delivery. Call
+// deliver after releasing any producer lock that orders commits with metadata
+// invalidation. Out-of-order deliveries cannot rewind a subscriber.
+func (s *Store) PutDeferred(snapshot v1.Snapshot) (changed bool, deliver func()) {
 	// Copy and hash before taking the shared lock. Independent databases should
 	// not serialize their JSON encoding or payload copying behind one another.
 	snapshot = clone(snapshot)
@@ -154,7 +163,7 @@ func (s *Store) Put(snapshot v1.Snapshot) bool {
 		routing = routingDigest(snapshot)
 	}
 	previous, exists := s.records[key]
-	changed := !exists || previous.routing != routing
+	changed = !exists || previous.routing != routing
 	if changed {
 		snapshot.Revision = s.nextRevision()
 	} else {
@@ -164,20 +173,25 @@ func (s *Store) Put(snapshot v1.Snapshot) bool {
 	s.records[key] = &record{publication: published, routing: routing, expired: expired}
 	notification := s.notification(key, published)
 	s.mu.Unlock()
-	notification.deliver()
-	return changed
+	return changed, notification.deliver
 }
 
 // Delete removes the current record and publishes a tombstone to watchers.
 // Watchers stay subscribed so recreation under the same name is observable.
 func (s *Store) Delete(namespace, name string) {
+	s.DeleteDeferred(namespace, name)()
+}
+
+// DeleteDeferred removes the record immediately and returns tombstone delivery
+// for execution after the producer releases its metadata lock.
+func (s *Store) DeleteDeferred(namespace, name string) func() {
 	key := clusterKey{namespace, name}
 	s.mu.Lock()
 	delete(s.unaryDemand, key)
 	previous, exists := s.records[key]
 	if !exists {
 		s.mu.Unlock()
-		return
+		return notification{}.deliver
 	}
 	// The tombstone reuses immutable connection parameters, without copying
 	// the removed member topology under the store lock.
@@ -191,7 +205,7 @@ func (s *Store) Delete(namespace, name string) {
 	delete(s.records, key)
 	notification := s.notification(key, s.newPublication(deleted))
 	s.mu.Unlock()
-	notification.deliver()
+	return notification.deliver
 }
 
 // ClusterIdentity returns the record's immutable identity without copying its
@@ -208,28 +222,41 @@ func (s *Store) ClusterIdentity(namespace, name string) (v1.ClusterRef, bool) {
 
 // Get fails closed on stale routing even when the periodic expiry task is late.
 func (s *Store) Get(namespace, name string) (v1.Snapshot, bool) {
-	published, exists := s.getPublication(namespace, name)
+	snapshot, exists, deliver := s.GetDeferred(namespace, name)
+	deliver()
+	return snapshot, exists
+}
+
+// GetDeferred reads current routing and commits any necessary expiry. Its
+// callback delivers that expiry outside the caller's metadata lock.
+func (s *Store) GetDeferred(namespace, name string) (v1.Snapshot, bool, func()) {
+	published, exists, deliver := s.readPublication(namespace, name)
 	if !exists {
-		return v1.Snapshot{}, false
+		return v1.Snapshot{}, false, deliver
 	}
-	return clone(published.snapshot), true
+	return clone(published.snapshot), true, deliver
 }
 
 // getPublication is reserved for internal read-only consumers. The publication
 // remains immutable after releasing the store lock, including across expiry.
 func (s *Store) getPublication(namespace, name string) (*publication, bool) {
+	published, exists, deliver := s.readPublication(namespace, name)
+	deliver()
+	return published, exists
+}
+
+func (s *Store) readPublication(namespace, name string) (*publication, bool, func()) {
 	key := clusterKey{namespace, name}
 	s.mu.Lock()
 	current, exists := s.records[key]
 	if !exists {
 		s.mu.Unlock()
-		return nil, false
+		return nil, false, notification{}.deliver
 	}
 	notification := s.expireRecord(key, current, time.Now())
 	published := current.publication
 	s.mu.Unlock()
-	notification.deliver()
-	return published, true
+	return published, true, notification.deliver
 }
 
 // Subscribe atomically registers a watcher and queues the current snapshot.

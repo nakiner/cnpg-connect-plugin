@@ -1,5 +1,51 @@
 # Validation record
 
+## Publication ordering and recovery load — 2026-09-19
+
+Subscriber notification and logging now run after the observer releases its
+metadata lock. Shared-CA invalidation flushes every notification before logging.
+The discovery and observer race suites passed, including blocked-log progress,
+multi-Cluster CA withdrawal, reverse-order deferred notifications and delayed
+conflicting-primary evidence. Ready-instance role checks remain unchanged.
+
+The production transport completed a three-minute, two-restart workload with
+2,000 independent TLS clients under a two-CPU / 2 GiB cgroup limit. It delivered
+1.8 million observations, with a 57 ms p95 bucket upper bound. This workload
+uses a synthetic producer and includes load-generator resource consumption;
+see [performance](performance.md#production-transport-under-sustained-load-september-19-2026)
+for measurements, reproduction and boundaries.
+
+The final paired run passed all nine selected live suites with no failures or
+skips on Kubernetes 1.34.0, CNPG 1.30.0 and PostgreSQL 18.4. The new soak retained
+32 application pools and exercised 64 workers through five promotion/outage
+cycles in 3m11s. All workers recovered after each transition, committed data
+remained readable, expired discovery blocked each pool, and cleanup left no
+application connections on the current primary. Both plugin replicas' metrics
+were collected and the owned kind node was removed. Source hashes matched the
+files used to start the run. No production cluster was changed.
+
+Earlier attempts exposed two test-harness defects, both fixed before the final
+run: the lifecycle test compared a promotion target with an independently chosen
+sync reader, and the soak scanned textual `SHOW max_connections` into an integer.
+The former now probes the exact target; the latter uses an explicit SQL cast.
+No library runtime change was required. Both CI workflows passed actionlint;
+the opt-in soak also runs on the weekly schedule.
+
+### Vulnerability scanner discrepancy
+
+On September 19, source and binary `govulncheck` reported `GO-2026-6443` for
+gRPC 1.84.0. The Go vulnerability database's affected-version range includes
+that release, but its source already contains both fixes: missing-authority
+rejection in the transport and the defensive xDS routing check. The release
+branch received the fix through [cherry-pick #9370](https://github.com/grpc/grpc-go/pull/9370)
+of [#9365](https://github.com/grpc/grpc-go/pull/9365). The plugin also does not
+import xDS routing in its production dependency graph.
+
+This is a version-range false positive, not a passing vulnerability scan.
+The dependency stays on 1.84.0; no finding is suppressed and the release scan
+still fails until the advisory range is corrected. See
+[the database entry](https://pkg.go.dev/vuln/GO-2026-6443).
+
 ## September 19, 2026: Secret watches and dependency adoption
 
 The current plugin/client pair passed eight suites with no failures or skips in

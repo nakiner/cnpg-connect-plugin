@@ -39,6 +39,8 @@ func podCluster(obj any) (clusterKey, bool) {
 }
 
 func (o *Observer) clusterEvent(oldObj, newObj any) {
+	var pending pendingDeliveries
+	defer pending.deliver()
 	o.stateMu.Lock()
 	defer o.stateMu.Unlock()
 	c := cachedCluster(newObj)
@@ -51,7 +53,7 @@ func (o *Observer) clusterEvent(oldObj, newObj any) {
 		o.cancelObservationLocked(key)
 		delete(o.primaries, key)
 		o.demandNext.Delete(key)
-		o.store.Delete(key.namespace, key.name)
+		pending.add(o.store.DeleteDeferred(key.namespace, key.name), nil)
 		return
 	}
 	old := cachedCluster(oldObj)
@@ -60,14 +62,14 @@ func (o *Observer) clusterEvent(oldObj, newObj any) {
 		o.cancelObservationLocked(key)
 		delete(o.primaries, key)
 		o.demandNext.Delete(key)
-		o.publish(unavailable(c, time.Now().UTC(), o.opts.TTL, "awaiting_observation"), time.Time{})
+		pending.add(o.commitPublication(unavailable(c, time.Now().UTC(), o.opts.TTL, "awaiting_observation"), time.Time{}))
 	}
 	if old != nil {
 		if sameClusterRoute(old, c) {
 			return
 		}
 		o.cancelObservationLocked(key)
-		o.publish(unavailable(c, time.Now().UTC(), o.opts.TTL, "topology_changed"), time.Time{})
+		pending.add(o.commitPublication(unavailable(c, time.Now().UTC(), o.opts.TTL, "topology_changed"), time.Time{}))
 	}
 	if o.store.HasDemand(key.namespace, key.name) {
 		o.Notify(key.namespace, key.name)
@@ -75,6 +77,8 @@ func (o *Observer) clusterEvent(oldObj, newObj any) {
 }
 
 func (o *Observer) clusterDeleted(obj any) {
+	var pending pendingDeliveries
+	defer pending.deliver()
 	o.stateMu.Lock()
 	defer o.stateMu.Unlock()
 	c := cachedCluster(obj)
@@ -87,12 +91,14 @@ func (o *Observer) clusterDeleted(obj any) {
 		return
 	}
 	o.cancelObservationLocked(key)
-	o.store.Delete(key.namespace, key.name)
+	pending.add(o.store.DeleteDeferred(key.namespace, key.name), nil)
 	delete(o.primaries, key)
 	o.demandNext.Delete(key)
 }
 
 func (o *Observer) podEvent(oldObj, newObj any) {
+	var pending pendingDeliveries
+	defer pending.deliver()
 	o.stateMu.Lock()
 	defer o.stateMu.Unlock()
 	old, new := cachedPod(oldObj), cachedPod(newObj)
@@ -116,16 +122,20 @@ func (o *Observer) podEvent(oldObj, newObj any) {
 				// reconnect can receive a retained, known-invalid route before I/O.
 				if old.Name == current {
 					o.cancelObservationLocked(key)
-					o.publish(unavailable(c, time.Now().UTC(), o.opts.TTL, "primary_changed"), time.Time{})
-				} else if snapshot, exists := o.store.Get(key.namespace, key.name); exists && snapshot.Cluster.UID == string(c.GetUID()) {
-					for i := range snapshot.Members {
-						if snapshot.Members[i].ID == string(old.UID) {
-							snapshot.Members[i].Ready = false
-							snapshot.Members[i].Reason = "member_changed"
+					pending.add(o.commitPublication(unavailable(c, time.Now().UTC(), o.opts.TTL, "primary_changed"), time.Time{}))
+				} else {
+					snapshot, exists, deliver := o.store.GetDeferred(key.namespace, key.name)
+					pending.add(deliver, nil)
+					if exists && snapshot.Cluster.UID == string(c.GetUID()) {
+						for i := range snapshot.Members {
+							if snapshot.Members[i].ID == string(old.UID) {
+								snapshot.Members[i].Ready = false
+								snapshot.Members[i].Reason = "member_changed"
+							}
 						}
+						// Do not extend the independent primary's observation lifetime.
+						pending.add(o.commitPublication(snapshot, time.Time{}))
 					}
-					// Do not extend the independent primary's observation lifetime.
-					o.publish(snapshot, time.Time{})
 				}
 			}
 		}

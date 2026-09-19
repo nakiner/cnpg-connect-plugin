@@ -26,16 +26,18 @@ func (o *Observer) observe(ctx context.Context, key clusterKey) bool {
 	o.stateMu.Lock()
 	c, exists := o.cluster(key)
 	if !exists {
-		o.store.Delete(key.namespace, key.name)
+		deliver := o.store.DeleteDeferred(key.namespace, key.name)
 		delete(o.primaries, key)
 		o.stateMu.Unlock()
+		deliver()
 		return true
 	}
 	enabled, params, paramErr := parameters(c)
 	if !enabled || c.GetDeletionTimestamp() != nil {
-		o.store.Delete(key.namespace, key.name)
+		deliver := o.store.DeleteDeferred(key.namespace, key.name)
 		delete(o.primaries, key)
 		o.stateMu.Unlock()
+		deliver()
 		return true
 	}
 	o.stateMu.Unlock()
@@ -72,6 +74,8 @@ func (o *Observer) observe(ctx context.Context, key clusterKey) bool {
 // Configuration failures use the current metadata, which may have changed while
 // the observation was loading connection defaults.
 func (o *Observer) publishFailure(ctx context.Context, key clusterKey, reason string, started time.Time) bool {
+	var pending pendingDeliveries
+	defer pending.deliver()
 	o.stateMu.Lock()
 	defer o.stateMu.Unlock()
 	if ctx.Err() != nil {
@@ -79,18 +83,18 @@ func (o *Observer) publishFailure(ctx context.Context, key clusterKey, reason st
 	}
 	latest, exists := o.cluster(key)
 	if !exists {
-		o.store.Delete(key.namespace, key.name)
+		pending.add(o.store.DeleteDeferred(key.namespace, key.name), nil)
 		return false
 	}
 	enabled, _, _ := parameters(latest)
 	if !enabled || latest.GetDeletionTimestamp() != nil {
-		o.store.Delete(key.namespace, key.name)
+		pending.add(o.store.DeleteDeferred(key.namespace, key.name), nil)
 		return false
 	}
 	snapshot := unavailable(latest, time.Now().UTC(), o.opts.TTL, reason)
 	current, target := primaryNames(latest)
 	snapshot.Transitioning = current == "" || current != target
-	o.publish(snapshot, started)
+	pending.add(o.commitPublication(snapshot, started))
 	return false
 }
 
@@ -148,17 +152,19 @@ func (o *Observer) publishObservation(
 	connection connectionInfo,
 	started time.Time,
 ) bool {
+	var pending pendingDeliveries
+	defer pending.deliver()
 	o.stateMu.Lock()
 	defer o.stateMu.Unlock()
 	latest, exists := o.cluster(key)
 	if !exists {
-		o.store.Delete(key.namespace, key.name)
+		pending.add(o.store.DeleteDeferred(key.namespace, key.name), nil)
 		delete(o.primaries, key)
 		return true
 	}
 	enabled, _, _ := parameters(latest)
 	if !enabled || latest.GetDeletionTimestamp() != nil {
-		o.store.Delete(key.namespace, key.name)
+		pending.add(o.store.DeleteDeferred(key.namespace, key.name), nil)
 		delete(o.primaries, key)
 		return true
 	}
@@ -174,12 +180,12 @@ func (o *Observer) publishObservation(
 	}
 	if !sameClusterRoute(observed, latest) {
 		o.Notify(key.namespace, key.name)
-		o.publish(unavailable(latest, time.Now().UTC(), o.opts.TTL, "topology_changed_during_observation"), started)
+		pending.add(o.commitPublication(unavailable(latest, time.Now().UTC(), o.opts.TTL, "topology_changed_during_observation"), started))
 		return false
 	}
 	if !o.currentCA(connection.ca) {
 		o.Notify(key.namespace, key.name)
-		o.publish(unavailable(latest, time.Now().UTC(), o.opts.TTL, "connection_defaults_changed"), started)
+		pending.add(o.commitPublication(unavailable(latest, time.Now().UTC(), o.opts.TTL, "connection_defaults_changed"), started))
 		return false
 	}
 	mapped := matchInstanceResults(probedPods, latestPods, results)
@@ -195,7 +201,7 @@ func (o *Observer) publishObservation(
 		}
 	}
 	snapshot.Connection = connection.ConnectionParameters
-	o.publish(snapshot, started)
+	pending.add(o.commitPublication(snapshot, started))
 	return snapshot.Available
 }
 
@@ -214,33 +220,4 @@ func matchInstanceResults(probedPods, currentPods []corev1.Pod, results []status
 		mapped[i] = results[previous]
 	}
 	return mapped
-}
-
-func (o *Observer) publish(snapshot v1.Snapshot, started time.Time) {
-	// Avoid flooding logs with dormant inventory placeholders.
-	changed := o.store.Put(snapshot)
-	if !changed || snapshot.Reason == "awaiting_observation" {
-		return
-	}
-	members := make([]string, 0, len(snapshot.Members))
-	primary := ""
-	for _, m := range snapshot.Members {
-		members = append(members, fmt.Sprintf("%s:%s:%s:%t", m.Name, m.Role, m.SyncState, m.Ready))
-		if m.ID == snapshot.PrimaryID {
-			primary = m.Name
-		}
-	}
-	elapsed := time.Duration(0)
-	if !started.IsZero() {
-		elapsed = time.Since(started)
-	}
-	o.log.Info("topology changed",
-		"namespace", snapshot.Cluster.Namespace,
-		"cluster", snapshot.Cluster.Name,
-		"primary", primary,
-		"available", snapshot.Available,
-		"reason", snapshot.Reason,
-		"members", members,
-		"observation_duration", elapsed,
-	)
 }

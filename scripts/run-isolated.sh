@@ -106,7 +106,7 @@ suite() {
   shift 4
   tests=$(IFS='|'; echo "$*")
   echo "Running $name"
-  (cd "$checkout" && go test -json -count=1 -timeout=15m -tags="$tag" -run "^($tests)$" "$package") \
+  (cd "$checkout" && go test -json -count=1 -timeout="${suite_timeout:-15m}" -tags="$tag" -run "^($tests)$" "$package") \
     | tee "$output/$name.jsonl"
   # A green Go exit alone allows skipped/missing tests. Require every named test
   # to pass, and reject skips (including subtests).
@@ -123,6 +123,9 @@ for ((iteration=1; iteration<=repetitions; iteration++)); do
 done
 suite client-outage "$library" integration ./test/integration TestLiveDiscoveryOutage
 suite client-stall "$library" integration ./test/integration TestLiveDiscoveryStall
+if [[ ${CNPGCONNECT_GO_E2E_SOAK:-0} == 1 ]]; then
+  suite_timeout=30m suite client-recovery-soak "$library" integration ./test/integration TestLiveRecoverySoak
+fi
 pods=$(kubectl get pods -n cnpg-system -l app.kubernetes.io/instance=connect -o json)
 jq -e '.items | length == 2' <<<"$pods" >/dev/null
 while read -r pod; do

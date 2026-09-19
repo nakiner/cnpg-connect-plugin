@@ -12,6 +12,10 @@ on:
         description: Client lifecycle repetitions (1-20)
         default: '1'
         type: string
+      soak:
+        description: Include sustained recovery with 32 pools and 64 sessions
+        default: false
+        type: boolean
   schedule:
     - cron: '15 3 * * 1'
 
@@ -28,6 +32,10 @@ jobs:
     timeout-minutes: 90
     env:
       REPETITIONS: ${{ inputs.repetitions || '1' }}
+      CNPGCONNECT_GO_E2E_SOAK: ${{ (github.event_name == 'schedule' || inputs.soak) && '1' || '0' }}
+      CNPGCONNECT_GO_E2E_SOAK_CLIENTS: '32'
+      CNPGCONNECT_GO_E2E_SOAK_POOL_SIZE: '2'
+      CNPGCONNECT_GO_E2E_SOAK_DURATION: 3m
     steps:
       # Dispatch inputs are data, never interpolated into shell code.
       - uses: actions/checkout@v7
@@ -55,6 +63,12 @@ jobs:
       - name: Exercise real plugin and client; reject skipped tests
         working-directory: plugin
         run: scripts/run-isolated.sh "$GITHUB_WORKSPACE/client" work/isolated-results "$REPETITIONS"
+      - name: Require the selected soak to have run
+        if: env.CNPGCONNECT_GO_E2E_SOAK == '1'
+        working-directory: plugin
+        run: >-
+          jq -se 'any(.[]; .Action == "pass" and .Test == "TestLiveRecoverySoak")'
+          work/isolated-results/client-recovery-soak.jsonl > /dev/null
       - name: Preserve measurements and logs (never kubeconfig or Secrets)
         if: always()
         uses: actions/upload-artifact@v6

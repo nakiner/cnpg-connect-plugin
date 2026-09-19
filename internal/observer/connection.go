@@ -119,6 +119,8 @@ func (o *Observer) secretEvent(obj any) {
 		return
 	}
 	key := types.NamespacedName{Namespace: meta.Namespace, Name: meta.Name}
+	var pending pendingDeliveries
+	defer pending.deliver()
 	o.stateMu.Lock()
 	defer o.stateMu.Unlock()
 	if o.currentCA(o.cas[key]) {
@@ -134,8 +136,10 @@ func (o *Observer) secretEvent(obj any) {
 	for _, c := range o.clustersUsingCA(key) {
 		cluster := clusterKey{c.GetNamespace(), c.GetName()}
 		o.cancelObservationLocked(cluster)
-		if snapshot, exists := o.store.Get(cluster.namespace, cluster.name); exists && (snapshot.Available || len(snapshot.Connection.ServerCAPEM) != 0) {
-			o.publish(unavailable(c, time.Now().UTC(), o.opts.TTL, "connection_defaults_changed"), time.Time{})
+		snapshot, exists, deliver := o.store.GetDeferred(cluster.namespace, cluster.name)
+		pending.add(deliver, nil)
+		if exists && (snapshot.Available || len(snapshot.Connection.ServerCAPEM) != 0) {
+			pending.add(o.commitPublication(unavailable(c, time.Now().UTC(), o.opts.TTL, "connection_defaults_changed"), time.Time{}))
 		}
 		o.Notify(cluster.namespace, cluster.name)
 	}

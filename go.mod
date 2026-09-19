@@ -6,7 +6,7 @@ require (
 	github.com/VictoriaMetrics/metrics v1.44.0
 	github.com/cloudnative-pg/cnpg-i v0.6.0
 	golang.org/x/net v0.59.0
-	google.golang.org/grpc v1.84.0
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0
