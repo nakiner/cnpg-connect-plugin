@@ -14,7 +14,7 @@ func TestMetadataWatchMetrics(t *testing.T) {
 	source := watch.NewRaceFreeFake()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tracked := o.trackWatch(ctx, source, &o.clusterWatch, cancel)
+	tracked := o.trackWatch(ctx, source, o.clusterWatch.begin(), cancel)
 	source.Error(&metav1.Status{Message: "private-error"})
 	<-tracked.ResultChan()
 	tracked.Stop()

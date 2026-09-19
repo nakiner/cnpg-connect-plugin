@@ -70,9 +70,9 @@ type Observer struct {
 	podInformer     cache.SharedIndexInformer
 	secretInformer  cache.SharedIndexInformer
 	ready           atomic.Bool
-	clusterWatch    atomic.Bool
-	podWatch        atomic.Bool
-	secretWatch     atomic.Bool
+	clusterWatch    watchHealth
+	podWatch        watchHealth
+	secretWatch     watchHealth
 
 	queue      workqueue.TypedRateLimitingInterface[clusterKey]
 	priority   *priorityQueue

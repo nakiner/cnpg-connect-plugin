@@ -18,6 +18,23 @@ var secretResource = schema.GroupVersionResource{Version: "v1", Resource: "secre
 
 const serverCAIndex = "serverCA"
 
+// Each watch owns its health flag, so a retiring watch cannot invalidate its
+// replacement. Only the current watch contributes to observer readiness.
+type watchHealth struct {
+	current atomic.Pointer[atomic.Bool]
+}
+
+func (h *watchHealth) begin() *atomic.Bool {
+	healthy := new(atomic.Bool)
+	h.current.Store(healthy)
+	return healthy
+}
+
+func (h *watchHealth) Load() bool {
+	healthy := h.current.Load()
+	return healthy != nil && healthy.Load()
+}
+
 func (o *Observer) initializeInformers() error {
 	o.clusterInformer = cache.NewSharedIndexInformer(&cache.ListWatch{
 		ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
@@ -103,17 +120,23 @@ func (o *Observer) watchPods(ctx context.Context, options metav1.ListOptions) (w
 
 // Renew quiet watches before snapshot expiry, so connectivity cannot remain
 // healthy indefinitely when a peer stops sending data without closing its socket.
-func (o *Observer) startWatch(ctx context.Context, options metav1.ListOptions, healthy *atomic.Bool, start func(context.Context, metav1.ListOptions) (watch.Interface, error)) (watch.Interface, error) {
+func (o *Observer) startWatch(ctx context.Context, options metav1.ListOptions, health *watchHealth, start func(context.Context, metav1.ListOptions) (watch.Interface, error)) (watch.Interface, error) {
+	healthy := health.begin()
 	lifetime := min(30*time.Second, o.opts.TTL/2)
 	timeoutSeconds := max(int64(1), int64(lifetime/time.Second))
 	options.TimeoutSeconds = &timeoutSeconds
 	options.AllowWatchBookmarks = true
 	ctx, cancel := context.WithTimeout(ctx, lifetime)
 	source, err := start(ctx, options)
+	if err == nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		o.watchErrors.Add(1)
-		healthy.Store(false)
 		cancel()
+		if source != nil {
+			source.Stop()
+		}
 		return nil, err
 	}
 	return o.trackWatch(ctx, source, healthy, cancel), nil

@@ -62,9 +62,9 @@ func fakeObserver(t *testing.T) (*Observer, *kubefake.Clientset, *fake.FakeDynam
 	}
 	o.clusterEvent(nil, cluster)
 	o.ready.Store(true)
-	o.clusterWatch.Store(true)
-	o.podWatch.Store(true)
-	o.secretWatch.Store(true)
+	o.clusterWatch.begin().Store(true)
+	o.podWatch.begin().Store(true)
+	o.secretWatch.begin().Store(true)
 	o.probe = func(_ context.Context, pod *corev1.Pod, _ v1.ConnectionParameters, _ string) (instanceStatus, error) {
 		for i := range pods {
 			if pods[i].Name == pod.Name {
@@ -211,7 +211,7 @@ func TestDisconnectedWatchDoesNotRenewCachedTopology(t *testing.T) {
 	o, _, _ := fakeObserver(t)
 	observe(t, o)
 	before, _ := o.store.Get("test", "db")
-	o.clusterWatch.Store(false)
+	o.clusterWatch.begin()
 	observe(t, o)
 	after, _ := o.store.Get("test", "db")
 	if !before.ValidUntil.Equal(after.ValidUntil) {
