@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM --platform=$BUILDPLATFORM golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:f4191582e1522dfc5980a6bdc0309a756f9697f3e7d0f199c7e26fc82ab324fd AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG VERSION=dev

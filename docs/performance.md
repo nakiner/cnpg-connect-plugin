@@ -327,24 +327,24 @@ This test excludes cold CA lookup, informer initialization, Kubernetes watch del
 
 ### Reproduce the component test
 
-From the current plugin repository with Go 1.27.1, run the same component workloads below. New results describe the current code and are not reproductions of the historical toolchain. To reproduce a historical release, use its corresponding source and toolchain together:
+From the current plugin repository with Go 1.26.8, run the same component workloads below. New results describe the current code and are not reproductions of the historical toolchain. To reproduce a historical release, use its corresponding source and toolchain together:
 
 ```sh
-GOWORK=off GOTOOLCHAIN=go1.27.1 go test -count=1 -tags=loadtest \
+GOWORK=off GOTOOLCHAIN=go1.26.8 go test -count=1 -tags=loadtest \
   -run '^TestFleetLoad$' -v ./internal/observer
 
-CNPG_LOAD_SLOW_BACKGROUND=1 GOWORK=off GOTOOLCHAIN=go1.27.1 \
+CNPG_LOAD_SLOW_BACKGROUND=1 GOWORK=off GOTOOLCHAIN=go1.26.8 \
   go test -count=1 -tags=loadtest -run '^TestFleetLoad$' -v ./internal/observer
 ```
 
 Run the additional component workloads with:
 
 ```sh
-GOWORK=off GOTOOLCHAIN=go1.27.1 go test -count=1 -tags=loadtest \
+GOWORK=off GOTOOLCHAIN=go1.26.8 go test -count=1 -tags=loadtest \
   -run '^TestColdStartFleet$' -v ./internal/observer
-CNPG_STREAM_CLIENTS=500 GOWORK=off GOTOOLCHAIN=go1.27.1 \
+CNPG_STREAM_CLIENTS=500 GOWORK=off GOTOOLCHAIN=go1.26.8 \
   go test -count=1 -tags=loadtest -run '^TestTLSClientLoad$' -v ./internal/discovery
-GOWORK=off GOTOOLCHAIN=go1.27.1 go test -run '^$' \
+GOWORK=off GOTOOLCHAIN=go1.26.8 go test -run '^$' \
   -bench '^BenchmarkStoreFanout$' -benchmem -benchtime=300ms ./internal/discovery
 ```
 
@@ -352,9 +352,9 @@ The fleet tests use fake Kubernetes clients; cold-start tests use a loopback API
 
 ```sh
 bench_dir="$(mktemp -d)"
-GOWORK=off GOTOOLCHAIN=go1.27.1 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+GOWORK=off GOTOOLCHAIN=go1.26.8 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
   go test -c -tags=loadtest -o "$bench_dir/observer.test" ./internal/observer
-GOWORK=off GOTOOLCHAIN=go1.27.1 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+GOWORK=off GOTOOLCHAIN=go1.26.8 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
   go test -c -tags=loadtest -o "$bench_dir/discovery.test" ./internal/discovery
 
 cat > "$bench_dir/Dockerfile" <<'EOF'

@@ -44,10 +44,12 @@ If you change the release name or `nameOverride`, update the spread selector too
 
 ## Adopting these changes
 
-Source builds and the matching Go client now require **Go 1.27.1 or newer**.
-Update application build images and CI toolchains before upgrading the library;
-the unchanged protobuf API does not remove the module's new compiler requirement.
-Prebuilt plugin images already include the selected toolchain's compiled binary.
+Plugin builds and vulnerability scans use **Go 1.26.8**, selected by the
+`toolchain` directive in `go.mod` and the Docker builder. The module's minimum
+remains Go 1.26.0; the preferred toolchain does not raise that minimum for
+applications importing the protobuf package. Keep application build images and
+CI on a patched Go release too. Prebuilt plugin images already include the
+selected toolchain's compiled binary.
 
 Admission limits are per plugin process. Count actual application client
 connections and watches, including rolling-update overlap and reconnect bursts.

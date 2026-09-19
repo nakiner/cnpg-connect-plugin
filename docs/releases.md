@@ -7,6 +7,9 @@ same tag in the workflow's ref selector. Branch runs do not publish.
 The workflow checks Go code, races and chart rendering, then builds Linux amd64
 and arm64 images. `govulncheck` scans the source and both final image binaries.
 Those exact images are pushed and combined into a multiarchitecture index.
+CI reads the preferred `toolchain` from `go.mod`, rather than building with the
+module's older compatibility minimum. Keep that toolchain and the Docker builder
+on the same patched Go version when updating them.
 The chart is packaged by Helm with its version and appVersion taken from the tag;
 its default image is pinned to the index digest. A Helm OCI pull-back verifies
 that the published archive matches the local archive.

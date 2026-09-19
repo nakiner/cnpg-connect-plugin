@@ -250,7 +250,7 @@ For thousands of databases, budget status traffic by active instance count, not 
 
 ## Run this checkout
 
-Building this source and the matching client requires Go **1.27.1+**. Chart checks also use Helm, jq, and the Go-based [yq](https://github.com/mikefarah/yq). Update application build images and CI toolchains before upgrading the library; protobuf compatibility does not imply compiler compatibility. Run the local checks with:
+Build and scan this checkout with Go **1.26.8**. The `toolchain` directive in `go.mod` selects this patched Go 1.26 release for CI and upgrades older local toolchains automatically, matching the Docker builder. The module's compatibility minimum remains Go 1.26.0; applications importing its protobuf package should still use a patched Go release. To select the exact compiler when a newer Go is installed, use `GOTOOLCHAIN=go1.26.8`. Chart checks also use Helm, jq, and the Go-based [yq](https://github.com/mikefarah/yq). Run the local checks with:
 
 ```sh
 go install github.com/mikefarah/yq/v4@v4.47.2

@@ -1,5 +1,20 @@
 # Validation record
 
+## Go 1.26 build and scan alignment — 2026-09-19
+
+CI previously selected the module's Go 1.26.0 compatibility minimum and reported
+24 standard-library vulnerabilities. `go.mod` now recommends `toolchain go1.26.8`,
+which the existing `actions/setup-go` steps select. The Docker builder and current
+build/performance commands also use 1.26.8. The module minimum remains 1.26.0;
+historical benchmark records retain the compiler actually used in those runs.
+
+With Go 1.26.8 and the current gRPC 1.83.2 dependency, `make check race vuln`
+passed: formatting, vet, unit/race tests, chart checks, source scanning and the
+compiled-binary scan. A fresh Linux/arm64 Docker build recorded Go 1.26.8 in its
+executable, passed its version smoke check, and returned no vulnerabilities from
+the image-binary scan. No finding was suppressed. Workflow lint passed too.
+These local checks do not represent a new live-cluster qualification.
+
 ## Publication ordering and recovery load — 2026-09-19
 
 Subscriber notification and logging now run after the observer releases its
@@ -41,10 +56,10 @@ branch received the fix through [cherry-pick #9370](https://github.com/grpc/grpc
 of [#9365](https://github.com/grpc/grpc-go/pull/9365). The plugin also does not
 import xDS routing in its production dependency graph.
 
-This is a version-range false positive, not a passing vulnerability scan.
-The dependency stays on 1.84.0; no finding is suppressed and the release scan
-still fails until the advisory range is corrected. See
-[the database entry](https://pkg.go.dev/vuln/GO-2026-6443).
+That qualification encountered a version-range false positive, not a passing
+vulnerability scan. It retained 1.84.0 without suppressing the finding. The
+current dependency is 1.83.2; the earlier failure does not describe the current
+dependency selection. See [the database entry](https://pkg.go.dev/vuln/GO-2026-6443).
 
 ## September 19, 2026: Secret watches and dependency adoption
 
